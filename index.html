@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#f6f5f1" />
+    <title>Текст сайта в Word</title>
+    <link rel="stylesheet" href="/assets/styles.css" />
+  </head>
+  <body>
+    <main class="page">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="Главная">
+          <span class="brand-mark">т</span>
+          <span>текст<span class="brand-muted">.вword</span></span>
+        </a>
+        <span class="top-note"><span class="status-dot"></span> Быстро и бесплатно</span>
+      </header>
+
+      <section class="hero" aria-labelledby="heading">
+        <div class="eyebrow"><span class="eyebrow-line"></span> ИЗ СЕТИ — В ДОКУМЕНТ</div>
+        <h1 id="heading">Текст сайта.<br /><span>В вашем Word.</span></h1>
+        <p class="intro">Укажите раздел сайта — парсер сохранит каждую найденную статью отдельным документом Word и сложит документы в ZIP-папку.</p>
+
+        <form id="export-form" class="url-form">
+          <label class="input-label" for="url">ССЫЛКА НА РАЗДЕЛ СО СТАТЬЯМИ</label>
+          <div class="input-row">
+            <span class="link-icon" aria-hidden="true">↗</span>
+            <input id="url" name="url" type="url" placeholder="https://example.com/articles" autocomplete="url" required />
+            <button id="submit-button" type="submit">
+              <span>Собрать статьи</span>
+              <span class="button-arrow" aria-hidden="true">→</span>
+            </button>
+          </div>
+          <div class="options-row">
+            <div class="option-field">
+              <label for="limit">Количество статей</label>
+              <select id="limit" name="limit">
+                <option value="max" selected>Макс. — все найденные</option>
+                <option value="100">100</option>
+                <option value="500">500</option>
+                <option value="1000">1000</option>
+              </select>
+            </div>
+            <fieldset class="date-range">
+              <legend>Даты публикации <span>(необязательно)</span></legend>
+              <label for="date-from">С</label>
+              <input id="date-from" name="dateFrom" type="date" />
+              <label for="date-to">По</label>
+              <input id="date-to" name="dateTo" type="date" />
+            </fieldset>
+          </div>
+          <p id="message" class="message" role="status" aria-live="polite">«Макс.» обходит до 10 000 страниц. Если указать «С», а «По» оставить пустым, конечной датой будет сегодня. Закрытые материалы не выгружаются. Сначала распакуйте ZIP.</p>
+          <section id="progress-panel" class="progress-panel" aria-live="polite" hidden>
+            <div class="progress-heading">
+              <strong id="progress-title">Подготовка…</strong>
+              <span id="progress-number"></span>
+            </div>
+            <progress id="progress-meter" max="100"></progress>
+            <p id="progress-detail" class="progress-detail">Задача поставлена в очередь.</p>
+          </section>
+        </form>
+
+        <div class="features">
+          <div class="feature"><span class="feature-icon">↧</span><span><strong>Word с картинками</strong><small>Отдельный DOCX на статью внутри ZIP-папки сайта</small></span></div>
+          <div class="feature"><span class="feature-icon">≋</span><span><strong>Один сайт за раз</strong><small>Обходит ссылки только на том же сайте</small></span></div>
+          <div class="feature"><span class="feature-icon">⌁</span><span><strong>Источники сохранены</strong><small>Ссылка на оригинал будет в документе</small></span></div>
+        </div>
+      </section>
+
+      <footer class="footer"><span>Личный инструмент для работы с открытыми страницами</span><span>01 <i>—</i> 01</span></footer>
+    </main>
+    <script src="/assets/app.js" defer></script>
+  </body>
+</html>

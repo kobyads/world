@@ -1,0 +1,1515 @@
+import { createServer } from 'node:http';
+import { randomUUID } from 'node:crypto';
+import { createReadStream, createWriteStream } from 'node:fs';
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import { dirname, extname, join, sep } from 'node:path';
+import { lookup } from 'node:dns/promises';
+import { isIP } from 'node:net';
+import { pipeline } from 'node:stream/promises';
+import { load } from 'cheerio';
+import { Document, HeadingLevel, ImageRun, Packer, Paragraph, TextRun } from 'docx';
+import robotsParser from 'robots-parser';
+import JSZip from 'jszip';
+import sharp from 'sharp';
+
+const directory = dirname(fileURLToPath(import.meta.url));
+const jobRootDirectory = process.env.LOCALAPPDATA
+  ? join(process.env.LOCALAPPDATA, 'Temp', 'opencode', 'site-to-word')
+  : join(directory, '.data');
+const jobDataDirectory = join(jobRootDirectory, 'jobs');
+const port = Number(process.env.PORT || 3000);
+const MAX_HTML_BYTES = 5 * 1024 * 1024;
+const MAX_REQUEST_BYTES = 10 * 1024;
+const MAX_REDIRECTS = 5;
+const MAX_TOTAL_TEXT = 100 * 1024 * 1024;
+const MAX_IMAGES_PER_ARTICLE = 8;
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const MAX_ARTICLE_IMAGE_BYTES = 8 * 1024 * 1024;
+const MAX_TOTAL_IMAGE_BYTES = 100 * 1024 * 1024;
+const MAX_CRAWL_PAGES = 10_000;
+const CRAWL_DELAY_MS = 1000;
+const KULTPROFITA_CONCURRENCY = 6;
+const DOCX_CONCURRENCY = 4;
+const jobs = new Map();
+
+function isPrivateIPv4(address) {
+  const parts = address.split('.').map(Number);
+  if (parts.length !== 4 || parts.some((part) => part < 0 || part > 255)) return true;
+  const [a, b] = parts;
+
+  return a === 0 || a === 10 || a === 127 || a >= 224
+    || (a === 100 && b >= 64 && b <= 127)
+    || (a === 169 && b === 254)
+    || (a === 172 && b >= 16 && b <= 31)
+    || (a === 192 && (b === 0 || b === 168))
+    || (a === 198 && (b === 18 || b === 19));
+}
+
+function isPrivateIPv6(address) {
+  const normalized = address.toLowerCase().split('%')[0];
+  if (normalized.startsWith('::ffff:')) {
+    const mapped = normalized.slice(7);
+    if (isIP(mapped) === 4) return isPrivateIPv4(mapped);
+    return true;
+  }
+
+  return normalized === '::'
+    || normalized === '::1'
+    || normalized.startsWith('fc')
+    || normalized.startsWith('fd')
+    || /^fe[89ab]/.test(normalized)
+    || normalized.startsWith('ff');
+}
+
+function isPrivateAddress(address) {
+  const version = isIP(address);
+  if (version === 4) return isPrivateIPv4(address);
+  if (version === 6) return isPrivateIPv6(address);
+  return true;
+}
+
+async function validatePublicUrl(value) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error('Введите корректную ссылку, например https://example.com');
+  }
+
+  if (!['http:', 'https:'].includes(url.protocol)) {
+    throw new Error('Поддерживаются только ссылки http:// и https://');
+  }
+  if (url.username || url.password) {
+    throw new Error('Ссылки с логином и паролем не поддерживаются');
+  }
+  if (url.port && !['80', '443'].includes(url.port)) {
+    throw new Error('Разрешены только стандартные порты 80 и 443');
+  }
+
+  const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (hostname === 'localhost' || hostname.endsWith('.localhost') || hostname.endsWith('.local')) {
+    throw new Error('Ссылки на локальные адреса не поддерживаются');
+  }
+
+  if (isIP(hostname)) {
+    if (isPrivateAddress(hostname)) throw new Error('Ссылки на локальные адреса не поддерживаются');
+    return url;
+  }
+
+  let addresses;
+  try {
+    addresses = await lookup(hostname, { all: true, verbatim: true });
+  } catch {
+    throw new Error('Не удалось найти сайт. Проверьте ссылку и подключение к интернету');
+  }
+  if (!addresses.length || addresses.some(({ address }) => isPrivateAddress(address))) {
+    throw new Error('Ссылки на локальные адреса не поддерживаются');
+  }
+
+  return url;
+}
+
+async function fetchPage(initialUrl, allowedOrigin = initialUrl.origin) {
+  let url = initialUrl;
+  for (let redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount += 1) {
+    const response = await fetch(url, {
+      redirect: 'manual',
+      signal: AbortSignal.timeout(15_000),
+      headers: {
+        'User-Agent': 'SiteToWord/1.0 (+text extraction)',
+        Accept: 'text/html,application/xhtml+xml',
+      },
+    });
+
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
+      const location = response.headers.get('location');
+      if (!location || redirectCount === MAX_REDIRECTS) {
+        throw new Error('Сайт перенаправляет слишком много раз');
+      }
+      url = await validatePublicUrl(new URL(location, url).toString());
+      if (url.origin !== allowedOrigin) {
+        throw new Error('Перенаправление на другой сайт остановлено');
+      }
+      continue;
+    }
+
+    if (!response.ok) throw new Error(`Сайт ответил ошибкой: HTTP ${response.status}`);
+    const contentType = response.headers.get('content-type') || '';
+    if (!contentType.includes('text/html') && !contentType.includes('application/xhtml+xml')) {
+      throw new Error('По этой ссылке находится не HTML-страница');
+    }
+
+    const declaredSize = Number(response.headers.get('content-length') || 0);
+    if (declaredSize > MAX_HTML_BYTES) throw new Error('Страница слишком большая для обработки');
+
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error('Не удалось прочитать страницу');
+    const chunks = [];
+    let totalBytes = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > MAX_HTML_BYTES) {
+        await reader.cancel();
+        throw new Error('Страница слишком большая для обработки');
+      }
+      chunks.push(value);
+    }
+
+    const body = Buffer.concat(chunks);
+    const declaredCharset = contentType.match(/charset\s*=\s*["']?([^;"'\s]+)/i)?.[1];
+    const initialMarkup = body.subarray(0, 4096).toString('latin1');
+    const metaCharset = initialMarkup.match(/<meta[^>]+charset\s*=\s*["']?([^"'\s/>]+)/i)?.[1]
+      || initialMarkup.match(/<meta[^>]+content=["'][^"']*charset\s*=\s*([^\s;"']+)/i)?.[1];
+    const charset = declaredCharset || metaCharset || 'utf-8';
+    let html;
+    try {
+      html = new TextDecoder(charset).decode(body);
+    } catch {
+      html = body.toString('utf8');
+    }
+    return { html, url: url.toString() };
+  }
+  throw new Error('Не удалось загрузить страницу');
+}
+
+async function fetchJsonPageOnce(initialUrl, allowedOrigin) {
+  let url = initialUrl;
+  for (let redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount += 1) {
+    const response = await fetch(url, {
+      redirect: 'manual',
+      signal: AbortSignal.timeout(15_000),
+      headers: {
+        'User-Agent': 'SiteToWord/1.0 (+text extraction)',
+        Accept: 'application/json',
+      },
+    });
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
+      const location = response.headers.get('location');
+      if (!location || redirectCount === MAX_REDIRECTS) throw new Error('Слишком много перенаправлений API');
+      url = await validatePublicUrl(new URL(location, url).toString());
+      if (url.origin !== allowedOrigin) throw new Error('Перенаправление API на другой сайт остановлено');
+      continue;
+    }
+    if (!response.ok) {
+      const error = new Error(`API сайта ответил ошибкой: HTTP ${response.status}`);
+      error.status = response.status;
+      error.retryAfter = response.headers.get('retry-after');
+      throw error;
+    }
+    const contentType = response.headers.get('content-type') || '';
+    if (!contentType.includes('application/json')) throw new Error('API вернул ответ не в JSON');
+    const body = await readLimitedText(response, 10 * 1024 * 1024);
+    try {
+      return JSON.parse(body);
+    } catch {
+      throw new Error('API сайта вернул некорректный JSON');
+    }
+  }
+  throw new Error('Не удалось загрузить данные API');
+}
+
+async function fetchJsonPage(initialUrl, allowedOrigin) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await fetchJsonPageOnce(initialUrl, allowedOrigin);
+    } catch (error) {
+      const retryable = error.name === 'TimeoutError'
+        || error.name === 'TypeError'
+        || error.status === 429
+        || error.status >= 500;
+      if (!retryable || attempt === 2) throw error;
+      const retryAfter = Number(error.retryAfter || 0) * 1000;
+      await wait(Math.max(retryAfter, 350 * (attempt + 1)));
+    }
+  }
+  throw new Error('Не удалось загрузить данные API');
+}
+
+async function readRobots(origin) {
+  const robotsUrl = new URL('/robots.txt', origin);
+  const safeUrl = await validatePublicUrl(robotsUrl.toString());
+  const response = await fetch(safeUrl, {
+    redirect: 'manual',
+    signal: AbortSignal.timeout(10_000),
+    headers: { 'User-Agent': 'SiteToWord/1.0 (+text extraction)' },
+  });
+
+  if (response.status === 404) return robotsParser(robotsUrl.toString(), '');
+  if ([301, 302, 303, 307, 308].includes(response.status)) {
+    const location = response.headers.get('location');
+    if (!location || new URL(location, safeUrl).origin !== origin) {
+      throw new Error('Перенаправление robots.txt на другой сайт остановлено');
+    }
+    const redirectedUrl = await validatePublicUrl(new URL(location, safeUrl).toString());
+    const redirectedResponse = await fetch(redirectedUrl, {
+      redirect: 'error',
+      signal: AbortSignal.timeout(10_000),
+      headers: { 'User-Agent': 'SiteToWord/1.0 (+text extraction)' },
+    });
+    if (!redirectedResponse.ok) throw new Error('Не удалось проверить правила robots.txt');
+    return robotsParser(robotsUrl.toString(), await readLimitedText(redirectedResponse, 512 * 1024));
+  }
+  if (!response.ok) throw new Error('Не удалось проверить правила robots.txt');
+  return robotsParser(robotsUrl.toString(), await readLimitedText(response, 512 * 1024));
+}
+
+async function readLimitedText(response, maxBytes) {
+  const reader = response.body?.getReader();
+  if (!reader) return '';
+  const chunks = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel();
+      throw new Error('Файл robots.txt слишком большой');
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+function normalizePublishedDate(candidate) {
+  if (!candidate) return '';
+  const value = String(candidate).trim();
+  const datePart = value.match(/^(\d{4}-\d{2}-\d{2})/)?.[1]
+    || value.match(/^(\d{2})\.(\d{2})\.(\d{4})$/)?.slice(1).reverse().join('-');
+  const parsed = new Date(datePart ? `${datePart}T00:00:00.000Z` : value);
+  return Number.isNaN(parsed.getTime()) ? '' : parsed.toISOString().slice(0, 10);
+}
+
+function cleanXmlText(value) {
+  return Array.from(String(value), (character) => character.codePointAt(0))
+    .filter((codePoint) => (
+      codePoint === 0x09
+      || codePoint === 0x0a
+      || codePoint === 0x0d
+      || (codePoint >= 0x20 && codePoint <= 0xd7ff)
+      || (codePoint >= 0xe000 && codePoint <= 0xfffd)
+      || (codePoint >= 0x10000 && codePoint <= 0x10ffff)
+    ))
+    .map((codePoint) => String.fromCodePoint(codePoint))
+    .join('');
+}
+
+function extractPage(html, pageUrl = 'https://example.invalid') {
+  const $ = load(html);
+  const title = $('title').first().text().trim()
+    || $('h1').first().text().trim()
+    || 'Текст страницы';
+  let publishedDate = '';
+
+  const dateCandidates = [
+    $('meta[property="article:published_time"]').attr('content'),
+    $('meta[name="datePublished"]').attr('content'),
+    $('meta[itemprop="datePublished"]').attr('content'),
+    $('time[datetime]').first().attr('datetime'),
+    $('[itemprop="datePublished"]').first().text(),
+  ];
+  $('script[type="application/ld+json"]').each((_, script) => {
+    try {
+      const data = JSON.parse($(script).text());
+      const collectDates = (value) => {
+        if (Array.isArray(value)) {
+          value.forEach(collectDates);
+        } else if (value && typeof value === 'object') {
+          if (typeof value.datePublished === 'string') dateCandidates.push(value.datePublished);
+          if (value['@graph']) collectDates(value['@graph']);
+        }
+      };
+      collectDates(data);
+    } catch {
+      // Некорректная JSON-LD разметка не мешает извлечению статьи.
+    }
+  });
+  for (const candidate of dateCandidates) {
+    if (!candidate) continue;
+    publishedDate = normalizePublishedDate(candidate);
+    if (publishedDate) {
+      break;
+    }
+  }
+
+  const links = [];
+  $('a[href]').each((_, element) => {
+    try {
+      const url = new URL($(element).attr('href'), pageUrl);
+      url.hash = '';
+      if (['http:', 'https:'].includes(url.protocol)) links.push(url.toString());
+    } catch {
+      // Пропускаем некорректные адреса.
+    }
+  });
+
+  const articleNodes = $('article');
+  const semanticContent = $('[itemprop="articleBody"], [class*="article-body"], [class*="post-content"]').first();
+  const hasArticleMarkup = semanticContent.length > 0
+    || $('main > article').length === 1
+    || articleNodes.length === 1;
+  $('script, style, noscript, svg, iframe, nav, footer, header, aside, form, button, [hidden], [aria-hidden="true"]').remove();
+
+  const root = semanticContent.length
+    ? semanticContent
+    : $('main > article').length === 1
+      ? $('main > article').first()
+      : articleNodes.length === 1
+        ? articleNodes.first()
+    : $('main').first().length
+      ? $('main').first()
+      : $('[role="main"]').first().length
+        ? $('[role="main"]').first()
+        : $('body');
+  const imageUrls = [];
+  root.find('img').each((_, element) => {
+    const image = $(element);
+    const candidates = [
+      image.attr('data-src'),
+      image.attr('data-lazy-src'),
+      image.attr('data-original'),
+      image.attr('src'),
+    ];
+    const srcSet = image.attr('srcset') || image.attr('data-srcset');
+    if (srcSet) {
+      const srcSetCandidates = srcSet.split(',').map((item) => item.trim().split(/\s+/)[0]);
+      candidates.unshift(...srcSetCandidates.reverse());
+    }
+    const src = candidates.find((candidate) => candidate && !candidate.startsWith('data:'));
+    if (!src) return;
+    try {
+      const url = new URL(src, pageUrl);
+      if (['http:', 'https:'].includes(url.protocol)) {
+        imageUrls.push({ url: url.toString(), alt: image.attr('alt')?.trim() || '' });
+      }
+    } catch {
+      // Игнорируем неправильные ссылки на картинки.
+    }
+  });
+  const blocks = [];
+  root.find('h1, h2, h3, h4, h5, h6, p, li, blockquote, pre, dt, dd, tr').each((_, element) => {
+    const tag = element.tagName.toLowerCase();
+    const text = tag === 'tr'
+      ? $(element).children('th, td').map((__, cell) => $(cell).text().replace(/\s+/g, ' ').trim()).get().join(' | ')
+      : $(element).text().replace(/\s+/g, ' ').trim();
+    if (text && (blocks.at(-1)?.text !== text)) {
+      blocks.push({ text: cleanXmlText(text), tag: tag === 'tr' ? 'p' : tag });
+    }
+  });
+
+  if (!blocks.length) {
+    const text = root.text().replace(/\s+/g, ' ').trim();
+    if (text) blocks.push({ text: cleanXmlText(text), tag: 'p' });
+  }
+  if (!blocks.length) throw new Error('На странице не найден текст');
+
+  const h1Count = root.find('h1').length;
+  const h2Count = root.find('h2').length;
+  const textLength = blocks.reduce((total, block) => total + block.text.length, 0);
+  const paragraphCount = blocks.filter((block) => ['p', 'li', 'blockquote', 'pre'].includes(block.tag)).length;
+  const isArticle = textLength >= 350
+    && paragraphCount >= 3
+    && (hasArticleMarkup || (h1Count === 1 && h2Count <= 12 && textLength >= 1000));
+
+  return {
+    title: cleanXmlText(title.replace(/\s+/g, ' ').trim()),
+    blocks,
+    links: [...new Set(links)],
+    images: [...new Map(imageUrls.map((image) => [image.url, image])).values()].slice(0, MAX_IMAGES_PER_ARTICLE),
+    isArticle,
+    textLength,
+    publishedDate,
+  };
+}
+
+async function readImageBytes(response) {
+  const declaredSize = Number(response.headers.get('content-length') || 0);
+  if (declaredSize > MAX_IMAGE_BYTES) return null;
+  const reader = response.body?.getReader();
+  if (!reader) return null;
+  const chunks = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_IMAGE_BYTES) {
+      await reader.cancel();
+      return null;
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks);
+}
+
+async function downloadImage(reference) {
+  try {
+    let url = await validatePublicUrl(reference.url);
+    for (let redirectCount = 0; redirectCount <= 3; redirectCount += 1) {
+      const response = await fetch(url, {
+        redirect: 'manual',
+        signal: AbortSignal.timeout(10_000),
+        headers: {
+          'User-Agent': 'SiteToWord/1.0 (+text extraction)',
+          Accept: 'image/png,image/jpeg,image/gif,image/bmp',
+        },
+      });
+      if ([301, 302, 303, 307, 308].includes(response.status)) {
+        const location = response.headers.get('location');
+        if (!location || redirectCount === 3) return null;
+        url = await validatePublicUrl(new URL(location, url).toString());
+        continue;
+      }
+      if (!response.ok) return null;
+
+      const contentType = (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+      if (!contentType.startsWith('image/')) return null;
+      const sourceData = await readImageBytes(response);
+      if (!sourceData) return null;
+      const source = sharp(sourceData, { animated: false });
+      const metadata = await source.metadata();
+      if (!metadata.width || !metadata.height || metadata.width * metadata.height > 40_000_000) return null;
+
+      let imageData = sourceData;
+      let imageType;
+      if (metadata.format === 'gif') {
+        imageType = 'gif';
+      } else {
+        const resized = source
+          .rotate()
+          .resize({ width: 1400, height: 1600, fit: 'inside', withoutEnlargement: true });
+        if (metadata.hasAlpha) {
+          imageData = await resized.png({ compressionLevel: 9, adaptiveFiltering: true }).toBuffer();
+          imageType = 'png';
+        } else {
+          imageData = await resized.jpeg({ quality: 82, mozjpeg: true }).toBuffer();
+          imageType = 'jpg';
+        }
+      }
+      const dimensions = await sharp(imageData).metadata();
+      if (!imageType || imageData.length > MAX_IMAGE_BYTES) return null;
+      const scale = Math.min(560 / dimensions.width, 680 / dimensions.height, 1);
+      return {
+        data: imageData,
+        type: imageType,
+        width: Math.max(1, Math.round(dimensions.width * scale)),
+        height: Math.max(1, Math.round(dimensions.height * scale)),
+        alt: reference.alt,
+      };
+    }
+  } catch {
+    // Если картинка недоступна, сохраняем текст статьи без неё.
+  }
+  return null;
+}
+
+async function downloadImages(references, remainingBytes = MAX_TOTAL_IMAGE_BYTES, onProgress = null) {
+  const images = [];
+  let totalBytes = 0;
+  const selectedReferences = references.slice(0, MAX_IMAGES_PER_ARTICLE);
+  for (const [index, reference] of selectedReferences.entries()) {
+    if (totalBytes >= remainingBytes) break;
+    if (index) await wait(100);
+    const image = await downloadImage(reference);
+    if (image && totalBytes + image.data.length <= remainingBytes) {
+      totalBytes += image.data.length;
+      images.push(image);
+    }
+    onProgress?.({ processed: index + 1, total: selectedReferences.length, found: images.length });
+  }
+  return { images, totalBytes };
+}
+
+function safeFilename(title) {
+  const slug = title
+    .normalize('NFKC')
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80);
+  return `${slug || 'tekst-stranitsy'}.docx`;
+}
+
+async function createWordDocument(articles) {
+  const paragraphs = [];
+  for (const [index, article] of articles.entries()) {
+    paragraphs.push(new Paragraph({
+      text: article.title,
+      heading: HeadingLevel.TITLE,
+      ...(index > 0 ? { pageBreakBefore: true } : {}),
+    }));
+    paragraphs.push(new Paragraph({
+      children: [new TextRun({
+        text: `Источник: ${article.url}${article.publishedDate ? ` · Дата публикации: ${article.publishedDate}` : ''}`,
+        italics: true,
+        color: '666666',
+      })],
+      spacing: { after: 280 },
+    }));
+
+    for (const block of article.blocks) {
+      const heading = /^h[1-6]$/.test(block.tag);
+      paragraphs.push(new Paragraph({
+        text: block.text,
+        ...(heading
+          ? { heading: block.tag === 'h1' ? HeadingLevel.HEADING_1 : HeadingLevel.HEADING_2 }
+          : block.tag === 'li' ? { bullet: { indent: 360 } } : {}),
+        spacing: { after: heading ? 140 : 180 },
+      }));
+    }
+
+    if (article.images?.length) {
+      paragraphs.push(new Paragraph({ text: 'Изображения', heading: HeadingLevel.HEADING_2 }));
+      for (const image of article.images) {
+        paragraphs.push(new Paragraph({
+          children: [new ImageRun({
+            data: image.data,
+            type: image.type,
+            transformation: { width: image.width, height: image.height },
+          })],
+          spacing: { after: 100 },
+        }));
+        if (image.alt) {
+          paragraphs.push(new Paragraph({
+            children: [new TextRun({ text: image.alt, italics: true, color: '666666' })],
+            spacing: { after: 180 },
+          }));
+        }
+      }
+    }
+  }
+
+  const document = new Document({
+    creator: 'Site to Word',
+    title: articles.length === 1 ? articles[0].title : `Сборник статей (${articles.length})`,
+    sections: [{ properties: {}, children: paragraphs }],
+  });
+  return Packer.toBuffer(document);
+}
+
+function isCrawlableUrl(value, origin) {
+  try {
+    const url = new URL(value);
+    if (url.origin !== origin) return false;
+    if (/\.(?:pdf|zip|rar|7z|jpe?g|png|gif|webp|svg|mp[34]|mov|woff2?|ttf|css|js)(?:$|[?#])/i.test(url.pathname)) return false;
+    if (/\/(?:login|logout|register|signup|account|profile|search|checkout)(?:\/|$)/i.test(url.pathname)) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function wait(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function recordArticleFailure(job, title, error) {
+  if (!job) return;
+  job.articleFailures += 1;
+  job.failedArticles.push({
+    title: cleanXmlText(title || 'Без названия'),
+    error: cleanXmlText(error?.message || String(error)),
+  });
+}
+
+function recordRestrictedArticle(job, title) {
+  if (!job) return;
+  job.restrictedArticles += 1;
+  job.restrictedArticleTitles.push(cleanXmlText(title || 'Без названия'));
+}
+
+function isKultprofitaMaterialsListing(url) {
+  const host = url.hostname.toLowerCase().replace(/^www\./, '');
+  return host === 'kultprofita.ru' && url.pathname.replace(/\/+$/, '') === '/lenta/materials';
+}
+
+async function loadKultprofitaCatalog(limit, dateFrom, dateTo, job) {
+  const apiOrigin = 'https://api.kultprofita.ru';
+  const apiRobots = await readRobots(apiOrigin);
+  const apiDelay = Math.max(250, Math.min(Number(apiRobots.getCrawlDelay('SiteToWord') || 0) * 1000, 10_000));
+  const pageSize = 100;
+  let offset = 0;
+  let total = Infinity;
+  const entries = [];
+  let undatedArticles = 0;
+  if (job) {
+    job.phase = 'loading-catalog';
+    await persistJob(job);
+  }
+
+  while (offset < total && entries.length < limit) {
+    const endpoint = new URL('/materials/public', apiOrigin);
+    endpoint.search = new URLSearchParams({
+      limit: String(pageSize),
+      offset: String(offset),
+      sort: 'new',
+      order: 'desc',
+    }).toString();
+    if (apiRobots.isAllowed(endpoint.toString(), 'SiteToWord') === false) {
+      throw new Error('Правила robots.txt запрещают чтение списка материалов');
+    }
+    if (offset) await wait(apiDelay);
+    const page = await fetchJsonPage(endpoint, apiOrigin);
+    if (!Array.isArray(page.items)) throw new Error('Не удалось прочитать список материалов сайта');
+    total = Number(page.total || 0);
+    if (job) {
+      job.catalogTotal = total;
+      job.catalogRead = offset;
+      job.phase = 'loading-catalog';
+    }
+
+    for (const item of page.items) {
+      const publishedDate = normalizePublishedDate(item.published_at);
+      if ((!publishedDate && (dateFrom || dateTo))) {
+        undatedArticles += 1;
+        continue;
+      }
+      if ((dateFrom && publishedDate < dateFrom) || (dateTo && publishedDate > dateTo)) continue;
+      if (item.can_read === false || item.effective_access_type !== 'public') {
+        recordRestrictedArticle(job, item.title);
+        continue;
+      }
+      const slug = item.published_slug || item.slug;
+      if (!slug) continue;
+      entries.push({
+        title: item.title || item.seo_title || slug,
+        slug,
+        publishedDate,
+        coverAssetId: item.cover_asset_id,
+      });
+      if (job) job.articlesFound = entries.length;
+      if (entries.length >= limit) break;
+    }
+
+    offset += page.items.length;
+    if (job) job.catalogRead = Math.min(offset, total);
+    if (!page.items.length) break;
+    if (job) await persistJob(job);
+  }
+
+  const selected = entries.slice(0, Number.isFinite(limit) ? limit : entries.length);
+  if (job) {
+    job.articlesFound = selected.length;
+    job.articlesTotal = selected.length;
+    job.articlesProcessed = 0;
+    job.undatedArticles = undatedArticles;
+    job.phase = 'loading-articles';
+    await persistJob(job);
+  }
+  return { entries: selected, total, apiOrigin, apiRobots, apiDelay, undatedArticles };
+}
+
+async function fetchKultprofitaArticle(entry, apiOrigin, apiRobots) {
+  const endpoint = new URL(`/materials/public/${encodeURIComponent(entry.slug)}`, apiOrigin);
+  if (apiRobots.isAllowed(endpoint.toString(), 'SiteToWord') === false) {
+    throw new Error('Правила robots.txt запрещают чтение материала');
+  }
+  const item = await fetchJsonPage(endpoint, apiOrigin);
+  if (item.can_read === false || !item.published_content_json) {
+    throw new Error('У этого материала нет публичного текста');
+  }
+
+  const html = (item.published_content_json.blocks || [])
+    .map((block) => block?.data?.html || '')
+    .filter(Boolean)
+    .join('\n');
+  if (!html) throw new Error('Не удалось извлечь текст материала');
+
+  const slug = item.published_slug || item.slug || entry.slug;
+  const articleUrl = `https://kultprofita.ru/materials/${encodeURIComponent(slug)}`;
+  const extracted = extractPage(html, `${apiOrigin}/`);
+  const images = [...extracted.images];
+  if (item.cover_asset_id) {
+    images.unshift({
+      url: `${apiOrigin}/files/public/assets/${encodeURIComponent(item.cover_asset_id)}`,
+      alt: item.title || entry.title,
+    });
+  }
+  return {
+    title: item.title || entry.title,
+    blocks: extracted.blocks,
+    images: [...new Map(images.map((image) => [image.url, image])).values()].slice(0, MAX_IMAGES_PER_ARTICLE),
+    url: articleUrl,
+    publishedDate: normalizePublishedDate(item.published_at) || entry.publishedDate,
+    textLength: extracted.textLength,
+  };
+}
+
+async function crawlKultprofitaArticles(catalog, job) {
+  const { entries } = catalog;
+  const results = new Array(entries.length);
+  let nextIndex = 0;
+  let totalText = 0;
+  let totalImageBytes = 0;
+  let activeImageDownloads = 0;
+  let fatalError = null;
+
+  job.phase = 'loading-articles';
+  job.pagesVisited = 0;
+  job.pagesQueued = entries.length;
+  job.articlesFound = entries.length;
+  job.articlesTotal = entries.length;
+  job.articlesProcessed = 0;
+  job.imagesFound = 0;
+  job.imagesProcessed = 0;
+  job.imagesToProcess = 0;
+
+  const worker = async () => {
+    while (!fatalError) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= entries.length) return;
+
+      const entry = entries[index];
+      job.pagesVisited = Math.min(entries.length, job.pagesVisited + 1);
+      job.pagesQueued = Math.max(0, entries.length - job.articlesProcessed);
+      job.currentArticle = entry.title;
+      if (!activeImageDownloads) job.phase = 'loading-articles';
+
+      try {
+        const article = await fetchKultprofitaArticle(entry, catalog.apiOrigin, catalog.apiRobots);
+        if (totalText + article.textLength > MAX_TOTAL_TEXT) {
+          fatalError = new Error('Общий объём текста превысил допустимый лимит');
+          return;
+        }
+
+        const imageReferences = article.images.slice(0, MAX_IMAGES_PER_ARTICLE);
+        job.imagesToProcess += imageReferences.length;
+        let previousFound = 0;
+        if (imageReferences.length) {
+          activeImageDownloads += 1;
+          job.phase = 'downloading-images';
+        }
+        let downloadedImages;
+        try {
+          downloadedImages = await downloadImages(
+            imageReferences,
+            MAX_ARTICLE_IMAGE_BYTES,
+            ({ processed, found }) => {
+              job.imagesProcessed += 1;
+              job.imagesFound += Math.max(0, found - previousFound);
+              previousFound = found;
+              if (processed >= imageReferences.length && activeImageDownloads <= 1) {
+                job.phase = 'loading-articles';
+              }
+            },
+          );
+        } finally {
+          if (imageReferences.length) {
+            activeImageDownloads = Math.max(0, activeImageDownloads - 1);
+            if (!activeImageDownloads) job.phase = 'loading-articles';
+          }
+        }
+
+        const remainingImageBudget = Math.max(0, MAX_TOTAL_IMAGE_BYTES - totalImageBytes);
+        const images = [];
+        let articleImageBytes = 0;
+        for (const image of downloadedImages.images) {
+          if (articleImageBytes + image.data.length > remainingImageBudget) break;
+          images.push(image);
+          articleImageBytes += image.data.length;
+        }
+
+        totalText += article.textLength;
+        totalImageBytes += articleImageBytes;
+        results[index] = { ...article, images };
+        job.articlesProcessed += 1;
+        job.pagesQueued = Math.max(0, entries.length - job.articlesProcessed);
+        if (job.articlesProcessed % 10 === 0 || job.articlesProcessed === entries.length) {
+          await persistJob(job);
+        }
+      } catch (error) {
+        if (error.message === 'Общий объём текста превысил допустимый лимит') {
+          fatalError = error;
+          return;
+        }
+        recordArticleFailure(job, entry.title, error);
+        job.pagesQueued = Math.max(0, entries.length - job.articlesProcessed - job.articleFailures);
+        await persistJob(job);
+      }
+    }
+  };
+
+  await Promise.all(
+    Array.from({ length: Math.min(KULTPROFITA_CONCURRENCY, entries.length) }, () => worker()),
+  );
+  if (fatalError) throw fatalError;
+
+  const articles = results.filter(Boolean);
+  if (!articles.length) {
+    throw new Error('Не удалось загрузить ни одной статьи из списка материалов');
+  }
+  job.articlesProcessed = articles.length;
+  job.articlesTotal = articles.length;
+  job.undatedArticles = catalog.undatedArticles;
+  job.crawlComplete = articles.length === entries.length;
+  job.phase = 'preparing-documents';
+  return {
+    articles,
+    undatedArticles: catalog.undatedArticles,
+    complete: job.crawlComplete,
+  };
+}
+
+async function crawlArticles(startUrl, limit, dateFrom = '', dateTo = '', job = null) {
+  const origin = startUrl.origin;
+  if (job) job.phase = 'checking-rules';
+  const robots = await readRobots(origin);
+  const userAgent = 'SiteToWord';
+  if (robots.isAllowed(startUrl.toString(), userAgent) === false) {
+    throw new Error('Правила robots.txt запрещают обработку указанной страницы');
+  }
+  const configuredDelay = Number(robots.getCrawlDelay(userAgent) || 0) * 1000;
+  const delay = Math.max(CRAWL_DELAY_MS, Math.min(configuredDelay, 10_000));
+  const kultprofitaListing = isKultprofitaMaterialsListing(startUrl);
+  const catalog = kultprofitaListing
+    ? await loadKultprofitaCatalog(limit, dateFrom, dateTo, job)
+    : null;
+  if (catalog) return crawlKultprofitaArticles(catalog, job);
+  const maxVisited = limit === Infinity
+    ? MAX_CRAWL_PAGES
+    : Math.min(5000, Math.max(100, limit * 4));
+  const maxDepth = catalog ? 0 : limit === Infinity ? Infinity : 3;
+  const queue = catalog
+    ? catalog.entries.map((entry) => ({
+      url: `https://kultprofita.ru/materials/${encodeURIComponent(entry.slug)}`,
+      depth: 1,
+      catalogEntry: entry,
+    }))
+    : [{ url: startUrl.toString(), depth: 0 }];
+  const visited = new Set();
+  const articles = [];
+  let totalText = 0;
+  let totalImageBytes = 0;
+  let undatedArticles = catalog?.undatedArticles || 0;
+  if (job && !catalog) job.phase = 'scanning';
+  if (job && catalog) {
+    job.pagesQueued = queue.length;
+    job.articlesFound = catalog.entries.length;
+    job.articlesTotal = catalog.entries.length;
+  }
+
+  while (queue.length && visited.size < maxVisited && articles.length < limit) {
+    const current = queue.shift();
+    if (!isCrawlableUrl(current.url, origin) || visited.has(current.url)) continue;
+    if (robots.isAllowed(current.url, userAgent) === false) continue;
+    visited.add(current.url);
+    if (job) {
+      job.pagesVisited = visited.size;
+      job.pagesQueued = catalog ? queue.length + 1 : visited.size + queue.length;
+      job.phase = catalog ? 'loading-articles' : 'scanning';
+      if (current.catalogEntry) job.currentArticle = current.catalogEntry.title;
+    }
+
+    if (visited.size > 1) await wait(Math.max(delay, catalog?.apiDelay || 0));
+    try {
+      const page = catalog
+        ? await fetchKultprofitaArticle(current.catalogEntry, catalog.apiOrigin, catalog.apiRobots)
+        : await fetchPage(new URL(current.url), origin);
+      const extracted = catalog ? page : extractPage(page.html, page.url);
+      const articleUrl = catalog ? page.url : page.url;
+      const publishedDate = catalog
+        ? page.publishedDate
+        : extracted.publishedDate;
+      if ((catalog || page.url !== startUrl.toString()) && (catalog || extracted.isArticle)) {
+        if (!publishedDate && (dateFrom || dateTo)) {
+          undatedArticles += 1;
+        } else if (
+          (!dateFrom || publishedDate >= dateFrom)
+          && (!dateTo || publishedDate <= dateTo)
+        ) {
+          if (totalText + extracted.textLength > MAX_TOTAL_TEXT) {
+            throw new Error('Общий объём текста превысил допустимый лимит');
+          }
+          if (job) {
+            if (!catalog) job.articlesFound = articles.length + 1;
+            job.phase = extracted.images.length
+              ? 'downloading-images'
+              : catalog ? 'loading-articles' : 'scanning';
+            job.currentArticle = extracted.title || current.catalogEntry?.title || '';
+            job.imagesProcessed = 0;
+            job.imagesToProcess = extracted.images.length;
+          }
+          const { images, totalBytes } = await downloadImages(
+            extracted.images,
+            MAX_TOTAL_IMAGE_BYTES - totalImageBytes,
+            job
+              ? ({ processed, total, found }) => {
+                job.imagesProcessed = processed;
+                job.imagesToProcess = total;
+                job.imagesFound = (job.imagesFound || 0) - (job.currentArticleImages || 0) + found;
+                job.currentArticleImages = found;
+              }
+              : null,
+          );
+          totalText += extracted.textLength;
+          totalImageBytes += totalBytes;
+          if (job) {
+            job.imagesFound = (job.imagesFound || 0) - (job.currentArticleImages || 0) + images.length;
+            job.currentArticleImages = 0;
+          }
+          articles.push({
+            title: extracted.title || current.catalogEntry?.title || 'Статья',
+            blocks: extracted.blocks,
+            url: articleUrl,
+            publishedDate,
+            images,
+          });
+          if (job) job.articlesProcessed = articles.length;
+        }
+      }
+
+      if (!catalog && current.depth < maxDepth) {
+        for (const link of extracted.links) {
+          if (!isCrawlableUrl(link, origin) || visited.has(link)) continue;
+          if (!queue.some((item) => item.url === link)) {
+            queue.push({ url: link, depth: current.depth + 1 });
+          }
+        }
+      }
+      if (job) job.pagesQueued = catalog ? queue.length : visited.size + queue.length;
+    } catch (error) {
+      if (error.message === 'Общий объём текста превысил допустимый лимит') throw error;
+      if (job && current.catalogEntry) {
+        job.articleFailures += 1;
+        job.lastArticleError = error.message;
+      }
+      // Ошибка отдельной страницы не останавливает сбор остальных материалов.
+    }
+  }
+
+  if (!articles.length) {
+    throw new Error('Статьи не найдены. Укажите страницу раздела со ссылками на статьи');
+  }
+  const result = {
+    articles,
+    undatedArticles,
+    complete: limit !== Infinity || (queue.length === 0 && visited.size < maxVisited),
+  };
+  if (job) {
+    if (!catalog) job.articlesFound = articles.length;
+    job.articlesProcessed = articles.length;
+    job.articlesTotal = articles.length;
+    job.undatedArticles = undatedArticles;
+    job.crawlComplete = result.complete;
+    job.phase = 'preparing-documents';
+  }
+  return result;
+}
+
+function validateDate(value, label) {
+  if (!value) return '';
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    throw new Error(`Некорректная дата «${label}»`);
+  }
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== value) {
+    throw new Error(`Некорректная дата «${label}»`);
+  }
+  return value;
+}
+
+async function createArticleArchive(articles, siteName, job = null) {
+  const zip = new JSZip();
+  const folder = zip.folder(siteName);
+  const documentsDirectory = job ? join(jobDataDirectory, job.id, 'documents') : null;
+  if (documentsDirectory) await mkdir(documentsDirectory, { recursive: true });
+  if (job) {
+    job.phase = 'preparing-documents';
+    job.articlesTotal = articles.length;
+    job.preparedArticles = 0;
+    await persistJob(job);
+  }
+  let nextDocument = 0;
+  const prepareWorker = async () => {
+    while (true) {
+      const index = nextDocument;
+      nextDocument += 1;
+      if (index >= articles.length) return;
+      const article = articles[index];
+      const articleImageCount = article.images.length;
+      try {
+        const document = await createWordDocument([article]);
+        await assertReadableDocx(document);
+        const number = String(index + 1).padStart(3, '0');
+        const filename = `${number}_${safeFilename(article.title)}`;
+        if (documentsDirectory) {
+          const documentPath = join(documentsDirectory, filename);
+          await writeFile(documentPath, document);
+          folder.file(filename, createReadStream(documentPath));
+          article.blocks = [];
+          article.images = [];
+        } else {
+          folder.file(filename, document);
+        }
+        if (job) {
+          job.preparedArticles += 1;
+          job.imagesIncluded += articleImageCount;
+        }
+      } catch (error) {
+        if (!job) throw error;
+        recordArticleFailure(job, article.title, error);
+        article.blocks = [];
+        article.images = [];
+      }
+      if (job && (job.preparedArticles % 10 === 0 || nextDocument >= articles.length)) {
+        await persistJob(job);
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(DOCX_CONCURRENCY, articles.length) }, () => prepareWorker()),
+  );
+  if (job && !job.preparedArticles) {
+    throw new Error('Не удалось собрать ни одного Word-файла');
+  }
+  folder.file(
+    'README.txt',
+    'Распакуйте ZIP-архив и открывайте файлы .docx в Microsoft Word или совместимом редакторе. Изображения размещены в конце документа статьи.\n',
+  );
+  if (job && (job.failedArticles.length || job.restrictedArticleTitles.length)) {
+    const report = [];
+    if (job.restrictedArticleTitles.length) {
+      report.push('Материалы, недоступные без соответствующего доступа:');
+      report.push(...job.restrictedArticleTitles.map((title) => `- ${title}`));
+      report.push('');
+    }
+    if (job.failedArticles.length) {
+      report.push('Материалы с временной или технической ошибкой:');
+      report.push(...job.failedArticles.map(({ title, error }) => `- ${title}: ${error}`));
+    }
+    folder.file('Отчет.txt', report.join('\n'));
+  }
+  if (job) {
+    job.phase = 'packing-zip';
+    job.zipPercent = 0;
+    await persistJob(job);
+    const archivePath = join(jobDataDirectory, job.id, `${siteName}.zip`);
+    await pipeline(
+      zip.generateNodeStream(
+        {
+          type: 'nodebuffer',
+          streamFiles: true,
+          compression: 'STORE',
+        },
+        (metadata) => {
+          job.zipPercent = Math.floor(metadata.percent);
+        },
+      ),
+      createWriteStream(archivePath),
+    );
+    const archiveStats = await stat(archivePath);
+    if (!archiveStats.size) throw new Error('Получился пустой ZIP-архив');
+    await rm(documentsDirectory, { recursive: true, force: true });
+    job.archivePath = archivePath;
+    job.archiveSize = archiveStats.size;
+    job.zipPercent = 100;
+    return;
+  }
+  const archive = await zip.generateAsync({ type: 'nodebuffer', compression: 'STORE' });
+  return archive;
+}
+
+async function assertReadableDocx(buffer) {
+  const documentZip = await JSZip.loadAsync(buffer);
+  const contentTypes = documentZip.file('[Content_Types].xml');
+  const mainDocument = documentZip.file('word/document.xml');
+  if (!contentTypes || !mainDocument) {
+    throw new Error('Не удалось собрать корректный Word-файл. Повторите выгрузку');
+  }
+  const xml = await mainDocument.async('text');
+  if (!xml.includes('<w:document')) {
+    throw new Error('Word-файл повреждён при создании. Повторите выгрузку');
+  }
+}
+
+function sendJson(response, statusCode, payload) {
+  response.writeHead(statusCode, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+  });
+  response.end(JSON.stringify(payload));
+}
+
+async function readJson(request) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of request) {
+    size += chunk.length;
+    if (size > MAX_REQUEST_BYTES) throw new Error('Запрос слишком большой');
+    chunks.push(chunk);
+  }
+  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+}
+
+function publicJobStatus(job) {
+  return {
+    id: job.id,
+    status: job.status,
+    phase: job.phase,
+    limit: job.limit,
+    pagesVisited: job.pagesVisited,
+    pagesQueued: job.pagesQueued,
+    catalogRead: job.catalogRead,
+    catalogTotal: job.catalogTotal,
+    articlesFound: job.articlesFound,
+    articlesProcessed: job.articlesProcessed,
+    articleFailures: job.articleFailures,
+    articlesTotal: job.articlesTotal,
+    preparedArticles: job.preparedArticles,
+    imagesFound: job.imagesFound,
+    imagesIncluded: job.imagesIncluded,
+    imagesProcessed: job.imagesProcessed,
+    imagesToProcess: job.imagesToProcess,
+    zipPercent: job.zipPercent,
+    undatedArticles: job.undatedArticles,
+    restrictedArticles: job.restrictedArticles,
+    crawlComplete: job.crawlComplete,
+    error: job.error,
+  };
+}
+
+function persistJob(job) {
+  const snapshot = JSON.stringify({
+    ...publicJobStatus(job),
+    createdAt: job.createdAt,
+    finishedAt: job.finishedAt,
+    siteName: job.siteName,
+    filename: job.filename,
+    archivePath: job.archivePath,
+    archiveSize: job.archiveSize,
+    failedArticles: job.failedArticles || [],
+    restrictedArticleTitles: job.restrictedArticleTitles || [],
+    request: job.request || null,
+    restartCount: job.restartCount || 0,
+  });
+  job.persistPromise = (job.persistPromise || Promise.resolve())
+    .catch(() => {})
+    .then(async () => {
+      const temporaryPath = join(jobDataDirectory, `${job.id}.${randomUUID()}.tmp`);
+      await writeFile(temporaryPath, snapshot, 'utf8');
+      await rename(temporaryPath, join(jobDataDirectory, `${job.id}.json`));
+    })
+    .catch(() => {});
+  return job.persistPromise;
+}
+
+async function restoreJobs() {
+  await mkdir(jobDataDirectory, { recursive: true });
+  const files = await readdir(jobDataDirectory);
+  const expiration = Date.now() - 24 * 60 * 60 * 1000;
+  for (const filename of files.filter((name) => name.endsWith('.json'))) {
+    const metadataPath = join(jobDataDirectory, filename);
+    try {
+      const stored = JSON.parse(await readFile(metadataPath, 'utf8'));
+      const fileId = filename.slice(0, -'.json'.length);
+      if (!/^[a-f0-9-]{36}$/i.test(fileId) || stored.id !== fileId) {
+        await rm(metadataPath, { force: true });
+        continue;
+      }
+      if (stored.createdAt < expiration) {
+        await rm(join(jobDataDirectory, fileId), { recursive: true, force: true });
+        await rm(metadataPath, { force: true });
+        continue;
+      }
+      const job = {
+        ...stored,
+        persistPromise: null,
+        articleFailures: Number(stored.articleFailures || 0),
+        failedArticles: Array.isArray(stored.failedArticles) ? stored.failedArticles : [],
+        restrictedArticles: Number(stored.restrictedArticles || 0),
+        restrictedArticleTitles: Array.isArray(stored.restrictedArticleTitles) ? stored.restrictedArticleTitles : [],
+      };
+      if (['queued', 'running'].includes(job.status)) {
+        if (job.request && (job.restartCount || 0) < 1) {
+          job.restartCount = (job.restartCount || 0) + 1;
+          job.status = 'queued';
+          job.phase = 'queued';
+          job.error = null;
+          jobs.set(job.id, job);
+          await persistJob(job);
+          const options = {
+            ...job.request,
+            limit: job.request.limit === 'max' ? Infinity : Number(job.request.limit),
+          };
+          setImmediate(() => void runCrawlJob(job, options));
+          continue;
+        }
+        job.status = 'error';
+        job.phase = 'error';
+        job.error = 'Сбор прервался при перезапуске сервера. Запустите его повторно.';
+        job.finishedAt = Date.now();
+      } else if (job.status === 'done') {
+        try {
+          if (!job.archivePath) throw new Error('Archive path missing');
+          if (!job.archivePath.startsWith(`${jobDataDirectory}${sep}${job.id}${sep}`)) {
+            throw new Error('Invalid archive location');
+          }
+          await stat(job.archivePath);
+        } catch {
+          job.status = 'error';
+          job.phase = 'error';
+          job.error = 'Архив больше не найден. Запустите сбор повторно.';
+          job.finishedAt = Date.now();
+        }
+      }
+      jobs.set(job.id, job);
+      if (job.status === 'error') await persistJob(job);
+    } catch {
+      await rm(metadataPath, { force: true });
+    }
+  }
+}
+
+async function pruneJobs() {
+  const expiration = Date.now() - 24 * 60 * 60 * 1000;
+  for (const [id, job] of jobs) {
+    if (job.createdAt < expiration && ['done', 'error'].includes(job.status)) {
+      jobs.delete(id);
+      await rm(join(jobDataDirectory, id), { recursive: true, force: true });
+      await rm(join(jobDataDirectory, `${id}.json`), { force: true });
+    }
+  }
+}
+
+async function runCrawlJob(job, options) {
+  job.status = 'running';
+  job.phase = 'checking-rules';
+  job.error = null;
+  job.pagesVisited = 0;
+  job.pagesQueued = 0;
+  job.catalogRead = 0;
+  job.catalogTotal = null;
+  job.articlesFound = 0;
+  job.articlesProcessed = 0;
+  job.articleFailures = 0;
+  job.failedArticles = [];
+  job.restrictedArticles = 0;
+  job.restrictedArticleTitles = [];
+  job.articlesTotal = null;
+  job.preparedArticles = 0;
+  job.imagesFound = 0;
+  job.imagesIncluded = 0;
+  job.imagesProcessed = 0;
+  job.imagesToProcess = 0;
+  job.zipPercent = 0;
+  job.archivePath = null;
+  job.archiveSize = 0;
+  await rm(join(jobDataDirectory, job.id), { recursive: true, force: true });
+  await persistJob(job);
+  try {
+    const safeUrl = await validatePublicUrl(options.url);
+    job.siteName = safeUrl.hostname.replace(/[^a-zA-Z0-9.-]/g, '_');
+    const result = await crawlArticles(safeUrl, options.limit, options.dateFrom, options.dateTo, job);
+    const imageCount = result.articles.reduce((count, article) => count + article.images.length, 0);
+    await createArticleArchive(result.articles, job.siteName, job);
+    job.articlesTotal = job.preparedArticles;
+    job.imagesFound = job.imagesIncluded ?? imageCount;
+    job.undatedArticles = result.undatedArticles;
+    job.crawlComplete = result.complete
+      && job.preparedArticles === result.articles.length
+      && job.articleFailures === 0;
+    job.filename = `${job.siteName}.zip`;
+    job.status = 'done';
+    job.phase = 'complete';
+    job.finishedAt = Date.now();
+    await persistJob(job);
+  } catch (error) {
+    job.status = 'error';
+    job.phase = 'error';
+    job.error = error.name === 'TimeoutError'
+      ? 'Сайт отвечает слишком долго. Попробуйте позже'
+      : error.message || 'Не удалось обработать сайт';
+    job.finishedAt = Date.now();
+    await persistJob(job);
+  }
+}
+
+const server = createServer(async (request, response) => {
+  const pathname = new URL(request.url, 'http://localhost').pathname;
+  if (request.method === 'GET' && pathname === '/') {
+    try {
+      const html = await readFile(join(directory, 'index.html'));
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      response.end(html);
+    } catch {
+      sendJson(response, 500, { error: 'Не удалось открыть интерфейс' });
+    }
+    return;
+  }
+
+  const jobMatch = pathname.match(/^\/api\/jobs\/([a-f0-9-]+)(?:\/(download))?$/i);
+  if (request.method === 'GET' && jobMatch) {
+    await pruneJobs();
+    const job = jobs.get(jobMatch[1]);
+    if (!job) {
+      sendJson(response, 404, { error: 'Задача не найдена или уже удалена' });
+      return;
+    }
+    if (jobMatch[2] === 'download') {
+      if (job.status !== 'done' || !job.archivePath) {
+        sendJson(response, 409, { error: 'Архив ещё не готов' });
+        return;
+      }
+      let archiveStats;
+      try {
+        archiveStats = await stat(job.archivePath);
+      } catch {
+        sendJson(response, 410, { error: 'Архив не найден на диске. Запустите сбор повторно' });
+        return;
+      }
+      response.writeHead(200, {
+        'Content-Type': 'application/zip',
+        'Content-Disposition': `attachment; filename="${job.filename}"`,
+        'Content-Length': job.archiveSize || archiveStats.size,
+        'X-Articles-Count': String(job.articlesTotal),
+        'X-Images-Count': String(job.imagesFound),
+        'X-Article-Failures': String(job.articleFailures),
+        'X-Restricted-Articles': String(job.restrictedArticles),
+        'X-Undated-Articles': String(job.undatedArticles),
+        'X-Crawl-Complete': String(job.crawlComplete),
+        'Cache-Control': 'no-store',
+      });
+      const archiveStream = createReadStream(job.archivePath);
+      archiveStream.on('error', () => response.destroy());
+      archiveStream.pipe(response);
+      return;
+    }
+    sendJson(response, 200, publicJobStatus(job));
+    return;
+  }
+
+  if (request.method === 'POST' && pathname === '/api/export') {
+    try {
+      const body = await readJson(request);
+      if (typeof body.url !== 'string' || !body.url.trim()) {
+        sendJson(response, 400, { error: 'Введите ссылку на сайт' });
+        return;
+      }
+      const safeUrl = await validatePublicUrl(body.url.trim());
+      const page = await fetchPage(safeUrl);
+      const extracted = extractPage(page.html, page.url);
+      const { images } = await downloadImages(extracted.images);
+      const article = { ...extracted, images, url: page.url };
+      const document = await createWordDocument([article]);
+      await assertReadableDocx(document);
+      response.writeHead(200, {
+        'Content-Type': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'Content-Disposition': `attachment; filename="page.docx"; filename*=UTF-8''${encodeURIComponent(safeFilename(article.title))}`,
+        'Content-Length': document.length,
+        'Cache-Control': 'no-store',
+      });
+      response.end(document);
+    } catch (error) {
+      const message = error.name === 'TimeoutError'
+        ? 'Сайт отвечает слишком долго. Попробуйте позже'
+        : error instanceof SyntaxError
+          ? 'Некорректный запрос'
+          : error.message || 'Не удалось обработать сайт';
+      sendJson(response, 400, { error: message });
+    }
+    return;
+  }
+
+  if (request.method === 'POST' && pathname === '/api/crawl') {
+    try {
+      const body = await readJson(request);
+      if (typeof body.url !== 'string' || !body.url.trim()) {
+        sendJson(response, 400, { error: 'Введите ссылку на раздел со статьями' });
+        return;
+      }
+      await pruneJobs();
+      if ([...jobs.values()].some((job) => ['queued', 'running'].includes(job.status))) {
+        sendJson(response, 409, { error: 'Сейчас уже выполняется другой сбор. Дождитесь его завершения' });
+        return;
+      }
+      const limit = body.limit === 'max'
+        ? Infinity
+        : Math.max(1, Math.min(1000, Math.floor(Number(body.limit) || 100)));
+      const dateFrom = validateDate(typeof body.dateFrom === 'string' ? body.dateFrom : '', 'с');
+      let dateTo = validateDate(typeof body.dateTo === 'string' ? body.dateTo : '', 'по');
+      if (dateFrom && !dateTo) dateTo = new Date().toISOString().slice(0, 10);
+      if (dateFrom && dateTo && dateFrom > dateTo) {
+        sendJson(response, 400, { error: 'Дата «с» должна быть раньше даты «по»' });
+        return;
+      }
+      const job = {
+        id: randomUUID(),
+        status: 'queued',
+        phase: 'queued',
+        limit: Number.isFinite(limit) ? limit : 'max',
+        pagesVisited: 0,
+        pagesQueued: 0,
+        catalogRead: 0,
+        catalogTotal: null,
+        articlesFound: 0,
+        articlesProcessed: 0,
+        articleFailures: 0,
+        failedArticles: [],
+        restrictedArticles: 0,
+        restrictedArticleTitles: [],
+        articlesTotal: null,
+        preparedArticles: 0,
+        imagesFound: 0,
+        imagesIncluded: 0,
+        imagesProcessed: 0,
+        imagesToProcess: 0,
+        zipPercent: 0,
+        undatedArticles: 0,
+        crawlComplete: null,
+        archivePath: null,
+        archiveSize: 0,
+        error: null,
+        request: {
+          url: body.url.trim(),
+          limit: Number.isFinite(limit) ? limit : 'max',
+          dateFrom,
+          dateTo,
+        },
+        restartCount: 0,
+        createdAt: Date.now(),
+      };
+      jobs.set(job.id, job);
+      await persistJob(job);
+      void runCrawlJob(job, {
+        url: body.url.trim(),
+        limit,
+        dateFrom,
+        dateTo,
+      });
+      sendJson(response, 202, { jobId: job.id });
+    } catch (error) {
+      const message = error.name === 'TimeoutError'
+        ? 'Сайт отвечает слишком долго. Попробуйте позже'
+        : error instanceof SyntaxError
+          ? 'Некорректный запрос'
+          : error.message || 'Не удалось обработать сайт';
+      sendJson(response, 400, { error: message });
+    }
+    return;
+  }
+
+  const contentType = { '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8' }[extname(pathname)];
+  if (request.method === 'GET' && pathname.startsWith('/assets/') && contentType) {
+    try {
+      const assetPath = join(directory, pathname.slice(1));
+      const asset = await readFile(assetPath);
+      response.writeHead(200, { 'Content-Type': contentType });
+      response.end(asset);
+    } catch {
+      sendJson(response, 404, { error: 'Файл не найден' });
+    }
+    return;
+  }
+
+  sendJson(response, 404, { error: 'Страница не найдена' });
+});
+
+await restoreJobs();
+
+server.listen(port, () => {
+  console.log(`Site to Word запущен: http://localhost:${port}`);
+});
