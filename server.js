@@ -33,6 +33,8 @@ const PAGE_CONCURRENCY = 4;
 const IMAGE_CONCURRENCY = 3;
 const KULTPROFITA_CONCURRENCY = 6;
 const DOCX_CONCURRENCY = 4;
+const MAX_DISCOVERY_DOCUMENTS = 8;
+const CRAWLER_NAME = 'SiteToWord';
 const jobs = new Map();
 
 function isPrivateIPv4(address) {
@@ -112,20 +114,30 @@ async function validatePublicUrl(value) {
   return url;
 }
 
-async function fetchPage(initialUrl, allowedOrigin = initialUrl.origin) {
+function checkRobots(url, robots) {
+  if (robots?.isAllowed(url.toString(), CRAWLER_NAME) === false) {
+    throw new Error('Правила robots.txt запрещают обработку указанной страницы');
+  }
+}
+
+async function fetchPage(initialUrl, allowedOrigin = initialUrl.origin, robots = null, acceptXml = false) {
   let url = initialUrl;
   for (let redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount += 1) {
+    checkRobots(url, robots);
     const response = await fetch(url, {
       redirect: 'manual',
       signal: AbortSignal.timeout(15_000),
       headers: {
         'User-Agent': 'SiteToWord/1.0 (+text extraction)',
-        Accept: 'text/html,application/xhtml+xml',
+        Accept: acceptXml
+          ? 'text/html,application/xhtml+xml,application/rss+xml,application/atom+xml,application/xml,text/xml'
+          : 'text/html,application/xhtml+xml',
       },
     });
 
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       const location = response.headers.get('location');
+      await response.body?.cancel();
       if (!location || redirectCount === MAX_REDIRECTS) {
         throw new Error('Сайт перенаправляет слишком много раз');
       }
@@ -136,14 +148,22 @@ async function fetchPage(initialUrl, allowedOrigin = initialUrl.origin) {
       continue;
     }
 
-    if (!response.ok) throw new Error(`Сайт ответил ошибкой: HTTP ${response.status}`);
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw new Error(`Сайт ответил ошибкой: HTTP ${response.status}`);
+    }
     const contentType = response.headers.get('content-type') || '';
-    if (!contentType.includes('text/html') && !contentType.includes('application/xhtml+xml')) {
+    const isXml = acceptXml && /^(?:text\/xml|application\/(?:xml|rss\+xml|atom\+xml))(?:\s*;|$)/i.test(contentType);
+    if (!isXml && !contentType.includes('text/html') && !contentType.includes('application/xhtml+xml')) {
+      await response.body?.cancel();
       throw new Error('По этой ссылке находится не HTML-страница');
     }
 
     const declaredSize = Number(response.headers.get('content-length') || 0);
-    if (declaredSize > MAX_HTML_BYTES) throw new Error('Страница слишком большая для обработки');
+    if (declaredSize > MAX_HTML_BYTES) {
+      await response.body?.cancel();
+      throw new Error('Страница слишком большая для обработки');
+    }
 
     const reader = response.body?.getReader();
     if (!reader) throw new Error('Не удалось прочитать страницу');
@@ -172,14 +192,15 @@ async function fetchPage(initialUrl, allowedOrigin = initialUrl.origin) {
     } catch {
       html = body.toString('utf8');
     }
-    return { html, url: url.toString() };
+    return { html, url: url.toString(), isXml };
   }
   throw new Error('Не удалось загрузить страницу');
 }
 
-async function fetchJsonPageOnce(initialUrl, allowedOrigin) {
+async function fetchJsonPageOnce(initialUrl, allowedOrigin, robots) {
   let url = initialUrl;
   for (let redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount += 1) {
+    checkRobots(url, robots);
     const response = await fetch(url, {
       redirect: 'manual',
       signal: AbortSignal.timeout(15_000),
@@ -190,6 +211,7 @@ async function fetchJsonPageOnce(initialUrl, allowedOrigin) {
     });
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       const location = response.headers.get('location');
+      await response.body?.cancel();
       if (!location || redirectCount === MAX_REDIRECTS) throw new Error('Слишком много перенаправлений API');
       url = await validatePublicUrl(new URL(location, url).toString());
       if (url.origin !== allowedOrigin) throw new Error('Перенаправление API на другой сайт остановлено');
@@ -199,10 +221,14 @@ async function fetchJsonPageOnce(initialUrl, allowedOrigin) {
       const error = new Error(`API сайта ответил ошибкой: HTTP ${response.status}`);
       error.status = response.status;
       error.retryAfter = response.headers.get('retry-after');
+      await response.body?.cancel();
       throw error;
     }
     const contentType = response.headers.get('content-type') || '';
-    if (!contentType.includes('application/json')) throw new Error('API вернул ответ не в JSON');
+    if (!contentType.includes('application/json')) {
+      await response.body?.cancel();
+      throw new Error('API вернул ответ не в JSON');
+    }
     const body = await readLimitedText(response, 10 * 1024 * 1024);
     try {
       return JSON.parse(body);
@@ -213,10 +239,10 @@ async function fetchJsonPageOnce(initialUrl, allowedOrigin) {
   throw new Error('Не удалось загрузить данные API');
 }
 
-async function fetchJsonPage(initialUrl, allowedOrigin) {
+async function fetchJsonPage(initialUrl, allowedOrigin, robots = null) {
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
-      return await fetchJsonPageOnce(initialUrl, allowedOrigin);
+      return await fetchJsonPageOnce(initialUrl, allowedOrigin, robots);
     } catch (error) {
       const retryable = error.name === 'TimeoutError'
         || error.name === 'TypeError'
@@ -291,10 +317,9 @@ function cleanXmlText(value) {
 
 function extractPage(html, pageUrl = 'https://example.invalid') {
   const $ = load(html, { scriptingEnabled: false });
-  const title = $('title').first().text().trim()
-    || $('h1').first().text().trim()
-    || 'Текст страницы';
   let publishedDate = '';
+  let structuredArticle;
+  const structuredLinks = [];
 
   const dateCandidates = [
     $('meta[property="article:published_time"]').attr('content'),
@@ -306,15 +331,22 @@ function extractPage(html, pageUrl = 'https://example.invalid') {
   $('script[type="application/ld+json"]').each((_, script) => {
     try {
       const data = JSON.parse($(script).text());
-      const collectDates = (value) => {
+      const collectMetadata = (value) => {
         if (Array.isArray(value)) {
-          value.forEach(collectDates);
+          value.forEach(collectMetadata);
         } else if (value && typeof value === 'object') {
           if (typeof value.datePublished === 'string') dateCandidates.push(value.datePublished);
-          if (value['@graph']) collectDates(value['@graph']);
+          const types = [value['@type']].flat();
+          if (types.some((type) => typeof type === 'string' && /(?:Article|BlogPosting)$/i.test(type))) structuredArticle ||= value;
+          if (Array.isArray(value.itemListElement)) {
+            for (const entry of value.itemListElement) {
+              structuredLinks.push(entry?.item?.url || entry?.item?.['@id'] || entry?.url);
+            }
+          }
+          if (value['@graph']) collectMetadata(value['@graph']);
         }
       };
-      collectDates(data);
+      collectMetadata(data);
     } catch {
       // Некорректная JSON-LD разметка не мешает извлечению статьи.
     }
@@ -327,16 +359,19 @@ function extractPage(html, pageUrl = 'https://example.invalid') {
     }
   }
 
-  const links = [];
-  $('a[href]').each((_, element) => {
-    try {
-      const url = new URL($(element).attr('href'), pageUrl);
-      url.hash = '';
-      if (['http:', 'https:'].includes(url.protocol)) links.push(url.toString());
-    } catch {
-      // Пропускаем некорректные адреса.
-    }
-  });
+  const title = (typeof structuredArticle?.headline === 'string' ? structuredArticle.headline.trim() : '')
+    || $('title').first().text().trim()
+    || $('h1').first().text().trim()
+    || 'Текст страницы';
+  const links = resolveUrls(pageUrl, [
+    ...$('a[href], link[rel="next"][href]').map((_, element) => $(element).attr('href')).get(),
+    ...structuredLinks,
+  ])
+    .filter((url) => url.startsWith('http'));
+  const feeds = $('link[rel~="alternate"][href]').filter((_, element) =>
+    /(?:rss|atom)\+xml/i.test($(element).attr('type') || ''),
+  ).map((_, element) => $(element).attr('href')).get();
+  const clientScripts = $('script[src], script[type="module"]').length > 0;
 
   const articleNodes = $('article');
   const semanticContent = $('[itemprop="articleBody"], [class*="article-body"], [class*="post-content"]').first();
@@ -366,7 +401,7 @@ function extractPage(html, pageUrl = 'https://example.invalid') {
         element.attr('data-src'),
       ];
     });
-    const urls = imageUrls(pageUrl, [
+    const urls = resolveUrls(pageUrl, [
       image.attr('data-src'),
       image.attr('data-lazy-src'),
       image.attr('data-original'),
@@ -377,11 +412,12 @@ function extractPage(html, pageUrl = 'https://example.invalid') {
     if (urls.length) images.push({ urls, alt: image.attr('alt')?.trim() || '' });
   });
   const hasBodyImages = images.length > 0;
-  const coverUrls = imageUrls(pageUrl, [
+  const coverUrls = resolveUrls(pageUrl, [
     $('meta[property="og:image:secure_url"]').first().attr('content'),
     $('meta[property="og:image"]').first().attr('content'),
     $('meta[name="twitter:image"]').first().attr('content'),
     $('link[rel="image_src"]').first().attr('href'),
+    ...[structuredArticle?.image].flat().map((image) => typeof image === 'string' ? image : image?.url),
   ]);
   if (coverUrls.length) images.unshift({
     urls: coverUrls,
@@ -403,18 +439,33 @@ function extractPage(html, pageUrl = 'https://example.invalid') {
     const text = root.text().replace(/\s+/g, ' ').trim();
     if (text) blocks.push({ text: cleanXmlText(text), tag: 'p' });
   }
+  const articleBody = structuredArticle?.articleBody;
+  if (typeof articleBody === 'string' && articleBody.trim().length > blocks.reduce((size, block) => size + block.text.length, 0)) {
+    blocks.length = 0;
+    for (const text of articleBody.split(/\n+/).map((line) => line.trim()).filter(Boolean)) {
+      blocks.push({ text: cleanXmlText(text), tag: 'p' });
+    }
+  }
   const h1Count = root.find('h1').length;
   const h2Count = root.find('h2').length;
   const textLength = blocks.reduce((total, block) => total + block.text.length, 0);
   const paragraphCount = blocks.filter((block) => ['p', 'li', 'blockquote', 'pre'].includes(block.tag)).length;
-  const isArticle = (hasArticleMarkup && hasBodyImages && (paragraphCount > 0 || h1Count > 0))
+  const explicitArticle = Boolean(structuredArticle
+    || $('meta[property="og:type"]').first().attr('content')?.toLowerCase() === 'article'
+    || semanticContent.length
+    || (articleNodes.length === 1 && h1Count === 1));
+  const isArticle = (explicitArticle && textLength >= 80 && paragraphCount > 0)
+    || (hasArticleMarkup && hasBodyImages && (paragraphCount > 0 || h1Count > 0))
     || (textLength >= 350 && paragraphCount >= 3
       && (hasArticleMarkup || (h1Count === 1 && h2Count <= 12 && textLength >= 1000)));
 
   return {
     title: cleanXmlText(title.replace(/\s+/g, ' ').trim()),
     blocks,
-    links: [...new Set(links)],
+    links,
+    feeds,
+    clientScripts,
+    explicitArticle,
     images: uniqueImages(images),
     isArticle,
     textLength,
@@ -444,7 +495,7 @@ function responsiveImages(srcset = '') {
     .map(({ url }) => url);
 }
 
-function imageUrls(pageUrl, candidates) {
+function resolveUrls(pageUrl, candidates) {
   const urls = new Set();
   for (const candidate of candidates) {
     if (typeof candidate !== 'string' || !candidate.trim()) continue;
@@ -745,7 +796,7 @@ async function loadKultprofitaCatalog(limit, dateFrom, dateTo, job) {
       throw new Error('Правила robots.txt запрещают чтение списка материалов');
     }
     if (offset) await wait(Math.max(250, apiDelay));
-    const page = await fetchJsonPage(endpoint, apiOrigin);
+    const page = await fetchJsonPage(endpoint, apiOrigin, apiRobots);
     if (!Array.isArray(page.items)) throw new Error('Не удалось прочитать список материалов сайта');
     total = Number(page.total || 0);
     if (job) {
@@ -800,7 +851,7 @@ async function fetchKultprofitaArticle(entry, apiOrigin, apiRobots) {
   if (apiRobots.isAllowed(endpoint.toString(), 'SiteToWord') === false) {
     throw new Error('Правила robots.txt запрещают чтение материала');
   }
-  const item = await fetchJsonPage(endpoint, apiOrigin);
+  const item = await fetchJsonPage(endpoint, apiOrigin, apiRobots);
   if (item.can_read === false || !item.published_content_json) {
     throw new Error('У этого материала нет публичного текста');
   }
@@ -915,69 +966,334 @@ async function crawlKultprofitaArticles(catalog, job) {
   };
 }
 
+function identifyPublicBlog(url) {
+  const host = url.hostname.replace(/^www\./, '');
+  const parts = url.pathname.split('/').filter(Boolean);
+  if (parts.shift() !== 'blog') return null;
+  try {
+    for (const [index, part] of parts.entries()) parts[index] = decodeURIComponent(part);
+  } catch {
+    return null;
+  }
+  if (/^one-vv\d+\.com$/.test(host) && parts.length <= 2) {
+    const [category, slug] = parts;
+    return { kind: 'one', category, slug };
+  }
+  if (host === 'csgo500.com') {
+    if (parts.length <= 1) return { kind: 'csg', slug: parts[0] };
+    if (parts.length === 2 && parts[0] === 'category') {
+      return { kind: 'csg', category: parts[1] };
+    }
+  }
+  return null;
+}
+
+function blogArticle(data, pageUrl, kind) {
+  const one = kind === 'one';
+  const html = one ? data.text : data.html;
+  if (typeof html !== 'string' || !html.trim()) return null;
+  const content = one ? html : html.replaceAll('cdn://', 'https://cdnv1.csgo500.io/');
+  const extracted = extractPage(content, pageUrl);
+  if (!extracted.blocks.length) return null;
+  const title = cleanXmlText((one ? data.header : data.title) || extracted.title);
+  const cover = one ? data.picture : String(data.bannerImage || '').replace('cdn://', 'https://cdnv1.csgo500.io/');
+  const urls = resolveUrls(pageUrl, [cover]);
+  const images = urls.length ? [{ urls, alt: title }, ...extracted.images] : extracted.images;
+  return {
+    title,
+    blocks: extracted.blocks,
+    images: uniqueImages(images),
+    textLength: extracted.textLength,
+    publishedDate: normalizePublishedDate(one ? data.publishedAt : data.createDate) || extracted.publishedDate,
+    url: pageUrl,
+  };
+}
+
+async function crawlPublicBlog(startUrl, source, robots, limit, dateFrom, dateTo, job) {
+  const origin = startUrl.origin;
+  const initialPage = await fetchPage(startUrl, origin, robots);
+  const one = source.kind === 'one';
+  const document = load(initialPage.html);
+  const locale = document('html').attr('lang') || 'ru-RU';
+  const delay = robotsDelay(robots);
+  const concurrency = delay ? 1 : PAGE_CONCURRENCY;
+  const articles = [];
+  const seen = new Set();
+  const cursors = new Set();
+  let totalText = 0;
+  let undatedArticles = 0;
+
+  const readApi = async (path, parameters) => {
+    if (delay) await wait(delay);
+    const endpoint = new URL(path, origin);
+    endpoint.search = new URLSearchParams(parameters);
+    return fetchJsonPage(endpoint, origin, robots);
+  };
+  const readOne = (categorySlug, slug) =>
+    readApi('/api/blog/v3/public/posts/get/by/slug', { locale, categorySlug, slug });
+  const readCsg = async (slug) => (await readApi('/api/blog/' + encodeURIComponent(slug))).blog;
+  const articleUrl = (category, slug) => new URL(
+    '/blog/' + (one ? encodeURIComponent(category) + '/' : '') + encodeURIComponent(slug), origin,
+  ).href;
+  const eligible = (url) => robots.isAllowed(url, CRAWLER_NAME) !== false;
+  const addArticle = (data, url) => {
+    if (!data || !eligible(url)) return;
+    const article = blogArticle(data, url, source.kind);
+    if (!article) return;
+    const { publishedDate } = article;
+    if (!publishedDate && (dateFrom || dateTo)) {
+      undatedArticles += 1;
+      return;
+    }
+    if ((dateFrom && publishedDate < dateFrom) || (dateTo && publishedDate > dateTo)) return;
+    totalText += article.textLength;
+    if (totalText > MAX_TOTAL_TEXT) throw new Error('Общий объём текста превысил допустимый лимит');
+    articles.push(article);
+    job.articlesFound = articles.length;
+    job.articlesProcessed = articles.length;
+  };
+
+  job.phase = 'scanning';
+  if (source.slug) {
+    job.pagesVisited = 1;
+    const data = one ? await readOne(source.category, source.slug) : await readCsg(source.slug);
+    addArticle(data, articleUrl(source.category, source.slug));
+  } else {
+    let cursor = one ? '' : 1;
+    while (cursor !== null && !cursors.has(cursor) && cursors.size < MAX_CRAWL_PAGES
+      && seen.size < MAX_CRAWL_PAGES && articles.length < limit) {
+      cursors.add(cursor);
+      const parameters = one
+        ? { locale, limit: String(Math.min(40, Math.max(10, limit - articles.length))) }
+        : { page: String(cursor) };
+      if (source.category) parameters[one ? 'categorySlug' : 'category'] = source.category;
+      if (one && cursor) parameters.cursor = cursor;
+      const page = await readApi(one ? '/api/blog/v3/public/posts/get/list' : '/api/blogs', parameters);
+      if (!Array.isArray(one ? page.items : page.blogs)) {
+        throw new Error('API сайта не вернул список статей');
+      }
+      const active = Array.isArray(page.otherActiveBlogs) ? page.otherActiveBlogs : [];
+      const items = one ? page.items : [...page.blogs, ...active];
+      cursor = one ? page.meta?.cursor || null : page.pagination?.nextPage ? cursor + 1 : null;
+      if (!items.length) cursor = null;
+      const entries = [];
+      for (const item of items) {
+        const slug = one ? item.slug : item.niceUrl || item._id;
+        if (!slug || (one && !item.categorySlug)) continue;
+        const url = articleUrl(item.categorySlug, slug);
+        if (seen.has(url) || !eligible(url)) continue;
+        seen.add(url);
+        entries.push({ item, slug, url });
+        if (seen.size >= MAX_CRAWL_PAGES) break;
+      }
+      job.pagesQueued = seen.size;
+      for (let next = 0; next < entries.length && articles.length < limit;) {
+        const batch = entries.slice(next, next + Math.min(concurrency, limit - articles.length));
+        next += batch.length;
+        const results = await Promise.allSettled(batch.map(({ item, slug }) =>
+          one ? Promise.resolve(item) : readCsg(slug),
+        ));
+        for (const [index, result] of results.entries()) {
+          job.pagesVisited += 1;
+          if (result.status === 'fulfilled') {
+            addArticle(result.value, batch[index].url);
+          } else {
+            recordArticleFailure(job, batch[index].item.title, result.reason);
+          }
+        }
+      }
+    }
+    if (!articles.length && job.failedArticles.length) throw new Error(job.failedArticles[0].error);
+    return { articles, undatedArticles, complete: articles.length >= limit || cursor === null };
+  }
+  return { articles, undatedArticles, complete: true };
+}
+
+function parseDiscoveryXml(xml, baseUrl) {
+  const $ = load(xml, { xml: true });
+  const root = $.root().children().first();
+  const name = (node) => node.name?.split(':').at(-1);
+  const children = (node, tag) => $(node).children().filter((_, child) => name(child) === tag);
+  const get = (node, tag) => children(node, tag).first();
+  const rootName = name(root.get(0) || {});
+  if (rootName === 'sitemapindex' || rootName === 'urlset') {
+    const index = rootName === 'sitemapindex';
+    const urls = resolveUrls(baseUrl, children(root, index ? 'sitemap' : 'url')
+      .map((_, item) => get(item, 'loc').text().trim()).get());
+    return { sitemaps: index ? urls : [], pages: index ? [] : urls, articles: [] };
+  }
+  const atom = rootName === 'feed';
+  if (!atom && rootName !== 'rss') return { sitemaps: [], pages: [], articles: [] };
+  const container = atom ? root : get(root, 'channel');
+  const pages = [];
+  const articles = [];
+  children(container, atom ? 'entry' : 'item').each((_, item) => {
+    const link = children(item, 'link').filter((_, child) => !$(child).attr('rel') || $(child).attr('rel') === 'alternate').first();
+    const [url] = resolveUrls(baseUrl, [atom ? link.attr('href') : link.text()]);
+    if (!url) return;
+    pages.push(url);
+    const content = get(item, atom ? 'content' : 'encoded');
+    const html = content.attr('type') === 'xhtml' ? content.html() : content.text();
+    if (!html?.trim() || content.attr('src')) return;
+    const extracted = extractPage(html, url);
+    const title = cleanXmlText(get(item, 'title').text().trim()) || extracted.title;
+    articles.push({
+      ...extracted,
+      url,
+      title,
+      publishedDate: normalizePublishedDate(get(item, atom ? 'published' : 'pubDate').text().trim()) || extracted.publishedDate,
+    });
+  });
+  return { sitemaps: [], pages, articles };
+}
+
+function inSitemapSection(url, startUrl) {
+  const scope = startUrl.pathname.replace(/\/+$/, '');
+  if (!scope) return true;
+  const path = new URL(url).pathname.replace(/\/+$/, '');
+  return path === scope || path.startsWith(scope + '/');
+}
+
+async function discoverAdditionalPages(startUrl, robots, feedUrls) {
+  const origin = startUrl.origin;
+  const section = startUrl.pathname.split('/').filter(Boolean).at(-1)?.toLowerCase();
+  const rank = (url) => section && new URL(url, origin).pathname.toLowerCase().includes(section) ? 0 : 1;
+  const advertised = resolveUrls(origin, robots.getSitemaps()).sort((a, b) => rank(a) - rank(b));
+  const queue = [...feedUrls, ...advertised.filter((url) => !rank(url)), new URL('/sitemap.xml', origin).href, ...advertised];
+  const visited = new Set();
+  const pages = new Set();
+  const articles = [];
+  const delay = robotsDelay(robots);
+  for (let index = 0; index < queue.length && visited.size < MAX_DISCOVERY_DOCUMENTS; index += 1) {
+    const url = queue[index];
+    if (!isCrawlableUrl(url, origin) || visited.has(url) || robots.isAllowed(url, CRAWLER_NAME) === false) continue;
+    visited.add(url);
+    if (delay) await wait(delay);
+    try {
+      const document = await fetchPage(new URL(url), origin, robots, true);
+      if (!document.isXml) continue;
+      const found = parseDiscoveryXml(document.html, document.url);
+      if (found.sitemaps.length) {
+        queue.splice(index + 1, 0, ...found.sitemaps.sort((a, b) => rank(a) - rank(b)).slice(0, MAX_DISCOVERY_DOCUMENTS));
+      }
+      const postSitemap = /\/posts?[-_.]/i.test(new URL(document.url).pathname);
+      for (const page of found.pages) {
+        if (!isCrawlableUrl(page, origin)) continue;
+        if (feedUrls.has(url) || postSitemap || inSitemapSection(page, startUrl)) pages.add(page);
+      }
+      articles.push(...found.articles);
+    } catch {
+      // Карта сайта и ленты дополняют обычный обход.
+    }
+  }
+  const articlePath = /\/(?:blog|posts?|news|articles?|journal|stories)\//i;
+  return {
+    pages: [...pages].sort((a, b) => Number(articlePath.test(b)) - Number(articlePath.test(a))),
+    articles,
+  };
+}
+
 async function crawlArticles(startUrl, limit, dateFrom, dateTo, job) {
   const origin = startUrl.origin;
   job.phase = 'checking-rules';
   const robots = await readRobots(origin);
-  const userAgent = 'SiteToWord';
-  if (robots.isAllowed(startUrl.toString(), userAgent) === false) {
-    throw new Error('Правила robots.txt запрещают обработку указанной страницы');
-  }
+  checkRobots(startUrl, robots);
   if (isKultprofitaMaterialsListing(startUrl)) {
     const catalog = await loadKultprofitaCatalog(limit, dateFrom, dateTo, job);
     return crawlKultprofitaArticles(catalog, job);
+  }
+  const publicBlog = identifyPublicBlog(startUrl);
+  if (publicBlog) {
+    const result = await crawlPublicBlog(startUrl, publicBlog, robots, limit, dateFrom, dateTo, job);
+    if (!result.articles.length) throw new Error('В публичном блоге не найдены статьи за выбранный период');
+    return result;
   }
 
   const delay = robotsDelay(robots);
   const concurrency = delay ? 1 : PAGE_CONCURRENCY;
   const maxVisited = limit === Infinity ? MAX_CRAWL_PAGES : Math.min(5000, Math.max(100, limit * 4));
   const maxDepth = limit === Infinity ? Infinity : 3;
-  const queue = [{ url: startUrl.toString(), depth: 0 }];
-  const discovered = new Set([startUrl.toString()]);
+  const queue = [{ url: startUrl.href, depth: 0 }];
+  const discovered = new Set([startUrl.href]);
+  const articleUrls = new Set();
+  const feedUrls = new Set();
   const articles = [];
   let next = 0;
   let pagesVisited = 0;
   let totalText = 0;
-  let undatedArticles = 0;
+  const undatedUrls = new Set();
+  let usedDiscovery = false;
+  let sawClientShell = false;
   job.phase = 'scanning';
 
-  while (next < queue.length && pagesVisited < maxVisited && articles.length < limit) {
+  const queueLink = (url, depth, fromSitemap = false) => {
+    if (discovered.has(url) || !isCrawlableUrl(url, origin) || robots.isAllowed(url, CRAWLER_NAME) === false) return;
+    discovered.add(url);
+    queue.push({ url, depth, fromSitemap });
+  };
+  const addArticle = (page) => {
+    if (articles.length >= limit || articleUrls.has(page.url) || !isCrawlableUrl(page.url, origin)
+      || robots.isAllowed(page.url, CRAWLER_NAME) === false || !page.blocks.length) return;
+    const { publishedDate } = page;
+    if (!publishedDate && (dateFrom || dateTo)) {
+      undatedUrls.add(page.url);
+      return;
+    }
+    undatedUrls.delete(page.url);
+    if ((dateFrom && publishedDate < dateFrom) || (dateTo && publishedDate > dateTo)) return;
+    totalText += page.textLength;
+    if (totalText > MAX_TOTAL_TEXT) throw new Error('Общий объём текста превысил допустимый лимит');
+    articleUrls.add(page.url);
+    const { title, blocks, url, images } = page;
+    articles.push({ title, blocks, url, publishedDate, images });
+  };
+
+  while (pagesVisited < maxVisited && articles.length < limit) {
+    if (next === queue.length) {
+      if (usedDiscovery) break;
+      usedDiscovery = true;
+      const extra = await discoverAdditionalPages(startUrl, robots, feedUrls);
+      for (const article of extra.articles) addArticle(article);
+      for (const url of extra.pages) queueLink(url, 1, true);
+      if (next === queue.length || articles.length >= limit) break;
+    }
     const count = Math.min(concurrency, maxVisited - pagesVisited);
     const batch = queue.slice(next, next + count);
     next += batch.length;
     if (delay && pagesVisited) await wait(delay);
-    const pages = await Promise.all(batch.map(async ({ url }) => {
+    const pages = await Promise.all(batch.map(async ({ url, depth }) => {
       try {
-        const page = await fetchPage(new URL(url), origin);
-        return { ...extractPage(page.html, page.url), url: page.url };
-      } catch {
-        // Ошибка отдельной страницы не останавливает сбор остальных материалов.
+        return await fetchPage(new URL(url), origin, robots, true);
+      } catch (error) {
+        if (!depth) throw error;
         return null;
       }
     }));
     pagesVisited += batch.length;
 
-    for (const [index, page] of pages.entries()) {
-      if (!page) continue;
-      if (page.url !== startUrl.toString() && page.isArticle) {
-        const { publishedDate } = page;
-        if (!publishedDate && (dateFrom || dateTo)) {
-          undatedArticles += 1;
-        } else if ((!dateFrom || publishedDate >= dateFrom) && (!dateTo || publishedDate <= dateTo)) {
-          totalText += page.textLength;
-          if (totalText > MAX_TOTAL_TEXT) throw new Error('Общий объём текста превысил допустимый лимит');
-          const { title, blocks, url, images } = page;
-          articles.push({ title, blocks, url, publishedDate, images });
-          if (articles.length === limit) break;
-        }
+    for (const [index, response] of pages.entries()) {
+      if (!response || articles.length >= limit) continue;
+      const entry = batch[index];
+      if (response.isXml) {
+        const found = parseDiscoveryXml(response.html, response.url);
+        for (const article of found.articles) addArticle(article);
+        for (const url of found.pages) queueLink(url, entry.depth + 1, true);
+        for (const url of found.sitemaps) feedUrls.add(url);
+        continue;
       }
-      const depth = batch[index].depth + 1;
+      const page = { ...extractPage(response.html, response.url), url: response.url };
+      const initial = entry.depth === 0;
+      if (initial) {
+        sawClientShell = page.clientScripts && !page.links.length && page.textLength < 100;
+        for (const href of resolveUrls(page.url, page.feeds)) feedUrls.add(href);
+      }
+      if ((page.isArticle && (!initial || page.explicitArticle))
+        || (entry.fromSitemap && page.textLength >= 160 && page.blocks.filter(({ tag }) => tag === 'p').length >= 2)) {
+        addArticle(page);
+      }
+      const depth = entry.depth + 1;
       if (depth > maxDepth) continue;
-      for (const url of page.links) {
-        if (discovered.has(url) || !isCrawlableUrl(url, origin)) continue;
-        discovered.add(url);
-        if (robots.isAllowed(url, userAgent) !== false) queue.push({ url, depth });
-      }
+      for (const url of page.links) queueLink(url, depth);
     }
     job.pagesVisited = pagesVisited;
     job.pagesQueued = queue.length;
@@ -986,12 +1302,16 @@ async function crawlArticles(startUrl, limit, dateFrom, dateTo, job) {
   }
 
   if (!articles.length) {
-    throw new Error('Статьи не найдены. Укажите страницу раздела со ссылками на статьи');
+    if (sawClientShell) {
+      throw new Error('Сайт загружает статьи через JavaScript. Публичная лента, карта сайта и HTML не содержат доступного текста статей.');
+    }
+    if (dateFrom || dateTo) throw new Error('Не найдено статей за выбранный период');
+    throw new Error('Статьи не найдены. Укажите ссылку на публичную статью, раздел блога или RSS-ленту.');
   }
+  job.articlesFound = articles.length;
+  job.articlesProcessed = articles.length;
   const complete = limit !== Infinity || (next === queue.length && pagesVisited < maxVisited);
-  job.undatedArticles = undatedArticles;
-  job.crawlComplete = complete;
-  return { articles, undatedArticles, complete };
+  return { articles, undatedArticles: undatedUrls.size, complete };
 }
 
 function validateDate(value, label) {
@@ -1394,12 +1714,17 @@ const server = createServer(async (request, response) => {
         return;
       }
       const safeUrl = await validatePublicUrl(body.url.trim());
-      const page = await fetchPage(safeUrl);
-      const extracted = extractPage(page.html, page.url);
-      const { images } = await downloadImages(extracted.images, page.url);
-      if (!extracted.blocks.length && !images.length) throw new Error('На странице не найден текст или изображения');
-      const article = { ...extracted, images, url: page.url };
-      const document = await createWordDocument([article]);
+      let article;
+      if (identifyPublicBlog(safeUrl)?.slug) {
+        const result = await crawlArticles(safeUrl, 1, '', '', {});
+        [article] = result.articles;
+      } else {
+        const page = await fetchPage(safeUrl);
+        article = { ...extractPage(page.html, page.url), url: page.url };
+      }
+      const { images } = await downloadImages(article.images, article.url);
+      if (!article.blocks.length && !images.length) throw new Error('На странице не найден текст или изображения');
+      const document = await createWordDocument([{ ...article, images }]);
       await assertReadableDocx(document);
       response.writeHead(200, {
         'Content-Type': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
