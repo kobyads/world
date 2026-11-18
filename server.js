@@ -25,12 +25,12 @@ const MAX_HTML_BYTES = 5 * 1024 * 1024;
 const MAX_REQUEST_BYTES = 10 * 1024;
 const MAX_REDIRECTS = 5;
 const MAX_TOTAL_TEXT = 100 * 1024 * 1024;
-const MAX_IMAGES_PER_ARTICLE = 8;
-const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
-const MAX_ARTICLE_IMAGE_BYTES = 8 * 1024 * 1024;
-const MAX_TOTAL_IMAGE_BYTES = 100 * 1024 * 1024;
+const MAX_SOURCE_IMAGE_BYTES = 12 * 1024 * 1024;
+const MAX_ARTICLE_IMAGE_BYTES = 32 * 1024 * 1024;
+const MAX_ARCHIVE_DOCUMENT_BYTES = 0xf0000000;
 const MAX_CRAWL_PAGES = 10_000;
-const CRAWL_DELAY_MS = 1000;
+const PAGE_CONCURRENCY = 4;
+const IMAGE_CONCURRENCY = 3;
 const KULTPROFITA_CONCURRENCY = 6;
 const DOCX_CONCURRENCY = 4;
 const jobs = new Map();
@@ -290,7 +290,7 @@ function cleanXmlText(value) {
 }
 
 function extractPage(html, pageUrl = 'https://example.invalid') {
-  const $ = load(html);
+  const $ = load(html, { scriptingEnabled: false });
   const title = $('title').first().text().trim()
     || $('h1').first().text().trim()
     || 'Текст страницы';
@@ -343,7 +343,7 @@ function extractPage(html, pageUrl = 'https://example.invalid') {
   const hasArticleMarkup = semanticContent.length > 0
     || $('main > article').length === 1
     || articleNodes.length === 1;
-  $('script, style, noscript, svg, iframe, nav, footer, header, aside, form, button, [hidden], [aria-hidden="true"]').remove();
+  $('script, style, svg, iframe, nav, footer, header, aside, form, button, [hidden], [aria-hidden="true"]').remove();
 
   const root = semanticContent.length
     ? semanticContent
@@ -356,31 +356,38 @@ function extractPage(html, pageUrl = 'https://example.invalid') {
       : $('[role="main"]').first().length
         ? $('[role="main"]').first()
         : $('body');
-  const imageUrls = [];
+  const images = [];
   root.find('img').each((_, element) => {
     const image = $(element);
-    const candidates = [
+    const pictureSources = image.parent('picture').children('source').toArray().flatMap((source) => {
+      const element = $(source);
+      return [
+        ...responsiveImages(element.attr('data-srcset') || element.attr('srcset')),
+        element.attr('data-src'),
+      ];
+    });
+    const urls = imageUrls(pageUrl, [
       image.attr('data-src'),
       image.attr('data-lazy-src'),
       image.attr('data-original'),
+      ...pictureSources,
+      ...responsiveImages(image.attr('data-srcset') || image.attr('data-lazy-srcset') || image.attr('srcset')),
       image.attr('src'),
-    ];
-    const srcSet = image.attr('srcset') || image.attr('data-srcset');
-    if (srcSet) {
-      const srcSetCandidates = srcSet.split(',').map((item) => item.trim().split(/\s+/)[0]);
-      candidates.unshift(...srcSetCandidates.reverse());
-    }
-    const src = candidates.find((candidate) => candidate && !candidate.startsWith('data:'));
-    if (!src) return;
-    try {
-      const url = new URL(src, pageUrl);
-      if (['http:', 'https:'].includes(url.protocol)) {
-        imageUrls.push({ url: url.toString(), alt: image.attr('alt')?.trim() || '' });
-      }
-    } catch {
-      // Игнорируем неправильные ссылки на картинки.
-    }
+    ]);
+    if (urls.length) images.push({ urls, alt: image.attr('alt')?.trim() || '' });
   });
+  const hasBodyImages = images.length > 0;
+  const coverUrls = imageUrls(pageUrl, [
+    $('meta[property="og:image:secure_url"]').first().attr('content'),
+    $('meta[property="og:image"]').first().attr('content'),
+    $('meta[name="twitter:image"]').first().attr('content'),
+    $('link[rel="image_src"]').first().attr('href'),
+  ]);
+  if (coverUrls.length) images.unshift({
+    urls: coverUrls,
+    alt: $('meta[property="og:image:alt"]').first().attr('content') || '',
+  });
+  root.find('noscript').remove();
   const blocks = [];
   root.find('h1, h2, h3, h4, h5, h6, p, li, blockquote, pre, dt, dd, tr').each((_, element) => {
     const tag = element.tagName.toLowerCase();
@@ -396,30 +403,87 @@ function extractPage(html, pageUrl = 'https://example.invalid') {
     const text = root.text().replace(/\s+/g, ' ').trim();
     if (text) blocks.push({ text: cleanXmlText(text), tag: 'p' });
   }
-  if (!blocks.length) throw new Error('На странице не найден текст');
-
   const h1Count = root.find('h1').length;
   const h2Count = root.find('h2').length;
   const textLength = blocks.reduce((total, block) => total + block.text.length, 0);
   const paragraphCount = blocks.filter((block) => ['p', 'li', 'blockquote', 'pre'].includes(block.tag)).length;
-  const isArticle = textLength >= 350
-    && paragraphCount >= 3
-    && (hasArticleMarkup || (h1Count === 1 && h2Count <= 12 && textLength >= 1000));
+  const isArticle = (hasArticleMarkup && hasBodyImages && (paragraphCount > 0 || h1Count > 0))
+    || (textLength >= 350 && paragraphCount >= 3
+      && (hasArticleMarkup || (h1Count === 1 && h2Count <= 12 && textLength >= 1000)));
 
   return {
     title: cleanXmlText(title.replace(/\s+/g, ' ').trim()),
     blocks,
     links: [...new Set(links)],
-    images: [...new Map(imageUrls.map((image) => [image.url, image])).values()].slice(0, MAX_IMAGES_PER_ARTICLE),
+    images: uniqueImages(images),
     isArticle,
     textLength,
     publishedDate,
   };
 }
 
+function responsiveImages(srcset = '') {
+  const entries = [];
+  const urls = /[^,\s][^\s]*/g;
+  let match;
+  while ((match = urls.exec(srcset))) {
+    const url = match[0].replace(/,+$/, '');
+    let descriptor = '';
+    if (url === match[0]) {
+      const comma = srcset.indexOf(',', urls.lastIndex);
+      const end = comma === -1 ? srcset.length : comma;
+      descriptor = srcset.slice(urls.lastIndex, end).trim();
+      urls.lastIndex = end + 1;
+    }
+    const value = Number.parseFloat(descriptor);
+    const width = descriptor.endsWith('x') ? value * 700 : value;
+    entries.push({ url, distance: Math.abs((width || 1000) - 1000) });
+  }
+  return entries
+    .sort((a, b) => a.distance - b.distance)
+    .map(({ url }) => url);
+}
+
+function imageUrls(pageUrl, candidates) {
+  const urls = new Set();
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string' || !candidate.trim()) continue;
+    try {
+      const url = new URL(candidate.trim(), pageUrl);
+      if (['http:', 'https:'].includes(url.protocol)) {
+        url.hash = '';
+        urls.add(url.href);
+      } else if (url.protocol === 'data:' && /^data:image\//i.test(url.href)) {
+        urls.add(url.href);
+      }
+    } catch {
+      // Некорректный адрес не мешает попробовать следующий вариант.
+    }
+  }
+  return [...urls];
+}
+
+function uniqueImages(images) {
+  const unique = new Map();
+  for (const image of images) {
+    const key = image.urls[0];
+    const previous = unique.get(key);
+    if (previous) {
+      previous.urls = [...new Set([...previous.urls, ...image.urls])];
+      previous.alt ||= image.alt;
+    } else {
+      unique.set(key, image);
+    }
+  }
+  return [...unique.values()];
+}
+
 async function readImageBytes(response) {
   const declaredSize = Number(response.headers.get('content-length') || 0);
-  if (declaredSize > MAX_IMAGE_BYTES) return null;
+  if (declaredSize > MAX_SOURCE_IMAGE_BYTES) {
+    await response.body?.cancel();
+    return null;
+  }
   const reader = response.body?.getReader();
   if (!reader) return null;
   const chunks = [];
@@ -428,7 +492,7 @@ async function readImageBytes(response) {
     const { done, value } = await reader.read();
     if (done) break;
     total += value.byteLength;
-    if (total > MAX_IMAGE_BYTES) {
+    if (total > MAX_SOURCE_IMAGE_BYTES) {
       await reader.cancel();
       return null;
     }
@@ -437,82 +501,113 @@ async function readImageBytes(response) {
   return Buffer.concat(chunks);
 }
 
-async function downloadImage(reference) {
-  try {
-    let url = await validatePublicUrl(reference.url);
-    for (let redirectCount = 0; redirectCount <= 3; redirectCount += 1) {
-      const response = await fetch(url, {
-        redirect: 'manual',
-        signal: AbortSignal.timeout(10_000),
-        headers: {
-          'User-Agent': 'SiteToWord/1.0 (+text extraction)',
-          Accept: 'image/png,image/jpeg,image/gif,image/bmp',
-        },
-      });
-      if ([301, 302, 303, 307, 308].includes(response.status)) {
-        const location = response.headers.get('location');
-        if (!location || redirectCount === 3) return null;
-        url = await validatePublicUrl(new URL(location, url).toString());
-        continue;
-      }
-      if (!response.ok) return null;
+async function fetchImageBytes(address, pageUrl) {
+  if (address.startsWith('data:')) {
+    const separator = address.indexOf(',');
+    if (separator === -1 || address.length - separator > MAX_SOURCE_IMAGE_BYTES * 3) return null;
+    const header = address.slice(0, separator);
+    const content = address.slice(separator + 1);
+    const data = /;base64$/i.test(header)
+      ? Buffer.from(content, 'base64')
+      : Buffer.from(decodeURIComponent(content));
+    return data.length <= MAX_SOURCE_IMAGE_BYTES ? data : null;
+  }
 
-      const contentType = (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
-      if (!contentType.startsWith('image/')) return null;
-      const sourceData = await readImageBytes(response);
-      if (!sourceData) return null;
-      const source = sharp(sourceData, { animated: false });
-      const metadata = await source.metadata();
-      if (!metadata.width || !metadata.height || metadata.width * metadata.height > 40_000_000) return null;
-
-      let imageData = sourceData;
-      let imageType;
-      if (metadata.format === 'gif') {
-        imageType = 'gif';
-      } else {
-        const resized = source
-          .rotate()
-          .resize({ width: 1400, height: 1600, fit: 'inside', withoutEnlargement: true });
-        if (metadata.hasAlpha) {
-          imageData = await resized.png({ compressionLevel: 9, adaptiveFiltering: true }).toBuffer();
-          imageType = 'png';
-        } else {
-          imageData = await resized.jpeg({ quality: 82, mozjpeg: true }).toBuffer();
-          imageType = 'jpg';
-        }
-      }
-      const dimensions = await sharp(imageData).metadata();
-      if (!imageType || imageData.length > MAX_IMAGE_BYTES) return null;
-      const scale = Math.min(560 / dimensions.width, 680 / dimensions.height, 1);
-      return {
-        data: imageData,
-        type: imageType,
-        width: Math.max(1, Math.round(dimensions.width * scale)),
-        height: Math.max(1, Math.round(dimensions.height * scale)),
-        alt: reference.alt,
-      };
+  let url = await validatePublicUrl(address);
+  const page = new URL(pageUrl);
+  const signal = AbortSignal.timeout(8_000);
+  for (let redirectCount = 0; redirectCount <= 3; redirectCount += 1) {
+    const response = await fetch(url, {
+      redirect: 'manual',
+      signal,
+      headers: {
+        'User-Agent': 'SiteToWord/1.0 (+text extraction)',
+        Accept: 'image/avif,image/webp,image/svg+xml,image/*,*/*;q=0.5',
+        Referer: page.origin === url.origin ? page.href : page.origin + '/',
+      },
+    });
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
+      const location = response.headers.get('location');
+      await response.body?.cancel();
+      if (!location || redirectCount === 3) return null;
+      url = await validatePublicUrl(new URL(location, url).toString());
+      continue;
     }
-  } catch {
-    // Если картинка недоступна, сохраняем текст статьи без неё.
+    const contentType = (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+    if (!response.ok || (contentType && !contentType.startsWith('image/') && contentType !== 'application/octet-stream')) {
+      await response.body?.cancel();
+      return null;
+    }
+    return readImageBytes(response);
   }
   return null;
 }
 
-async function downloadImages(references, remainingBytes = MAX_TOTAL_IMAGE_BYTES, onProgress = null) {
+async function downloadImage(reference, pageUrl) {
+  for (const url of reference.urls) {
+    try {
+      const sourceData = await fetchImageBytes(url, pageUrl);
+      if (!sourceData?.length) continue;
+      const source = sharp(sourceData, { limitInputPixels: 40_000_000 });
+      const metadata = await source.metadata();
+      if (!metadata.width || !metadata.height) continue;
+      if (metadata.format === 'gif') {
+        // Проверяем, что GIF декодируется, и сохраняем анимацию в исходном файле.
+        await source.stats();
+        const scale = Math.min(560 / metadata.width, 680 / metadata.height, 1);
+        return {
+          url, data: sourceData, type: 'gif',
+          width: Math.max(1, Math.round(metadata.width * scale)),
+          height: Math.max(1, Math.round(metadata.height * scale)),
+          alt: reference.alt,
+        };
+      }
+      const resized = source
+        .rotate()
+        .resize({ width: 1400, height: 1600, fit: 'inside', withoutEnlargement: true });
+      const type = metadata.hasAlpha ? 'png' : 'jpg';
+      const { data, info } = await (type === 'png' ? resized.png() : resized.jpeg({ quality: 82 }))
+        .toBuffer({ resolveWithObject: true });
+      const scale = Math.min(560 / info.width, 680 / info.height, 1);
+      return {
+        url, data, type,
+        width: Math.max(1, Math.round(info.width * scale)),
+        height: Math.max(1, Math.round(info.height * scale)),
+        alt: reference.alt,
+      };
+    } catch {
+      // Пробуем другой адрес того же изображения.
+    }
+  }
+  return null;
+}
+
+async function downloadImages(references, pageUrl, onProgress) {
   const images = [];
+  const seen = new Set();
   let totalBytes = 0;
-  const selectedReferences = references.slice(0, MAX_IMAGES_PER_ARTICLE);
-  for (const [index, reference] of selectedReferences.entries()) {
-    if (totalBytes >= remainingBytes) break;
-    if (index) await wait(100);
-    const image = await downloadImage(reference);
-    if (image && totalBytes + image.data.length <= remainingBytes) {
+  let skipped = 0;
+  for (let offset = 0; offset < references.length; offset += IMAGE_CONCURRENCY) {
+    if (totalBytes >= MAX_ARTICLE_IMAGE_BYTES) {
+      skipped += references.length - offset;
+      onProgress?.(references.length - offset);
+      break;
+    }
+    const batch = references.slice(offset, offset + IMAGE_CONCURRENCY);
+    const downloaded = await Promise.all(batch.map((reference) => downloadImage(reference, pageUrl)));
+    for (const image of downloaded) {
+      if (image && seen.has(image.url)) continue;
+      if (!image || totalBytes + image.data.length > MAX_ARTICLE_IMAGE_BYTES) {
+        skipped += 1;
+        continue;
+      }
+      seen.add(image.url);
       totalBytes += image.data.length;
       images.push(image);
     }
-    onProgress?.({ processed: index + 1, total: selectedReferences.length, found: images.length });
+    onProgress?.(batch.length);
   }
-  return { images, totalBytes };
+  return { images, skipped };
 }
 
 function safeFilename(title) {
@@ -600,6 +695,10 @@ function wait(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+function robotsDelay(robots) {
+  return Math.max(0, Math.min(2_147_483_647, (Number(robots.getCrawlDelay('SiteToWord')) || 0) * 1000));
+}
+
 function recordArticleFailure(job, title, error) {
   if (!job) return;
   job.articleFailures += 1;
@@ -623,8 +722,8 @@ function isKultprofitaMaterialsListing(url) {
 async function loadKultprofitaCatalog(limit, dateFrom, dateTo, job) {
   const apiOrigin = 'https://api.kultprofita.ru';
   const apiRobots = await readRobots(apiOrigin);
-  const apiDelay = Math.max(250, Math.min(Number(apiRobots.getCrawlDelay('SiteToWord') || 0) * 1000, 10_000));
-  const pageSize = 100;
+  const apiDelay = robotsDelay(apiRobots);
+  const pageSize = dateFrom || dateTo ? 100 : Math.min(100, Math.max(20, limit));
   let offset = 0;
   let total = Infinity;
   const entries = [];
@@ -645,7 +744,7 @@ async function loadKultprofitaCatalog(limit, dateFrom, dateTo, job) {
     if (apiRobots.isAllowed(endpoint.toString(), 'SiteToWord') === false) {
       throw new Error('Правила robots.txt запрещают чтение списка материалов');
     }
-    if (offset) await wait(apiDelay);
+    if (offset) await wait(Math.max(250, apiDelay));
     const page = await fetchJsonPage(endpoint, apiOrigin);
     if (!Array.isArray(page.items)) throw new Error('Не удалось прочитать список материалов сайта');
     total = Number(page.total || 0);
@@ -693,7 +792,7 @@ async function loadKultprofitaCatalog(limit, dateFrom, dateTo, job) {
     job.phase = 'loading-articles';
     await persistJob(job);
   }
-  return { entries: selected, total, apiOrigin, apiRobots, apiDelay, undatedArticles };
+  return { entries: selected, apiOrigin, apiRobots, apiDelay, undatedArticles };
 }
 
 async function fetchKultprofitaArticle(entry, apiOrigin, apiRobots) {
@@ -706,26 +805,37 @@ async function fetchKultprofitaArticle(entry, apiOrigin, apiRobots) {
     throw new Error('У этого материала нет публичного текста');
   }
 
-  const html = (item.published_content_json.blocks || [])
-    .map((block) => block?.data?.html || '')
-    .filter(Boolean)
-    .join('\n');
-  if (!html) throw new Error('Не удалось извлечь текст материала');
+  const blocks = item.published_content_json.blocks || [];
+  const html = blocks.map((block) => {
+    if (block?.data?.html) return block.data.html;
+    const text = block?.data?.text;
+    return typeof text === 'string' && text.trim()
+      ? '<p>' + text.replaceAll('&', '&amp;').replaceAll('<', '&lt;') + '</p>'
+      : '';
+  }).join('\n');
+  if (!html.trim()) throw new Error('Не удалось извлечь текст материала');
 
   const slug = item.published_slug || item.slug || entry.slug;
   const articleUrl = `https://kultprofita.ru/materials/${encodeURIComponent(slug)}`;
   const extracted = extractPage(html, `${apiOrigin}/`);
+  if (!extracted.blocks.length) throw new Error('Не удалось извлечь текст материала');
   const images = [...extracted.images];
-  if (item.cover_asset_id) {
-    images.unshift({
-      url: `${apiOrigin}/files/public/assets/${encodeURIComponent(item.cover_asset_id)}`,
-      alt: item.title || entry.title,
-    });
+  const assetUrl = (id) => `${apiOrigin}/files/public/assets/${encodeURIComponent(id)}`;
+  for (const block of blocks) {
+    const assetIds = block?.data?.asset_ids;
+    if (!Array.isArray(assetIds)) continue;
+    for (const id of assetIds) {
+      if (id) images.push({ urls: [assetUrl(id)], alt: '' });
+    }
+  }
+  const coverAssetId = item.cover_asset_id || entry.coverAssetId || item.seo_image_asset_id;
+  if (coverAssetId) {
+    images.unshift({ urls: [assetUrl(coverAssetId)], alt: item.title || entry.title });
   }
   return {
     title: item.title || entry.title,
     blocks: extracted.blocks,
-    images: [...new Map(images.map((image) => [image.url, image])).values()].slice(0, MAX_IMAGES_PER_ARTICLE),
+    images: uniqueImages(images),
     url: articleUrl,
     publishedDate: normalizePublishedDate(item.published_at) || entry.publishedDate,
     textLength: extracted.textLength,
@@ -737,8 +847,6 @@ async function crawlKultprofitaArticles(catalog, job) {
   const results = new Array(entries.length);
   let nextIndex = 0;
   let totalText = 0;
-  let totalImageBytes = 0;
-  let activeImageDownloads = 0;
   let fatalError = null;
 
   job.phase = 'loading-articles';
@@ -747,9 +855,6 @@ async function crawlKultprofitaArticles(catalog, job) {
   job.articlesFound = entries.length;
   job.articlesTotal = entries.length;
   job.articlesProcessed = 0;
-  job.imagesFound = 0;
-  job.imagesProcessed = 0;
-  job.imagesToProcess = 0;
 
   const worker = async () => {
     while (!fatalError) {
@@ -761,7 +866,7 @@ async function crawlKultprofitaArticles(catalog, job) {
       job.pagesVisited = Math.min(entries.length, job.pagesVisited + 1);
       job.pagesQueued = Math.max(0, entries.length - job.articlesProcessed);
       job.currentArticle = entry.title;
-      if (!activeImageDownloads) job.phase = 'loading-articles';
+      if (catalog.apiDelay) await wait(catalog.apiDelay);
 
       try {
         const article = await fetchKultprofitaArticle(entry, catalog.apiOrigin, catalog.apiRobots);
@@ -770,46 +875,8 @@ async function crawlKultprofitaArticles(catalog, job) {
           return;
         }
 
-        const imageReferences = article.images.slice(0, MAX_IMAGES_PER_ARTICLE);
-        job.imagesToProcess += imageReferences.length;
-        let previousFound = 0;
-        if (imageReferences.length) {
-          activeImageDownloads += 1;
-          job.phase = 'downloading-images';
-        }
-        let downloadedImages;
-        try {
-          downloadedImages = await downloadImages(
-            imageReferences,
-            MAX_ARTICLE_IMAGE_BYTES,
-            ({ processed, found }) => {
-              job.imagesProcessed += 1;
-              job.imagesFound += Math.max(0, found - previousFound);
-              previousFound = found;
-              if (processed >= imageReferences.length && activeImageDownloads <= 1) {
-                job.phase = 'loading-articles';
-              }
-            },
-          );
-        } finally {
-          if (imageReferences.length) {
-            activeImageDownloads = Math.max(0, activeImageDownloads - 1);
-            if (!activeImageDownloads) job.phase = 'loading-articles';
-          }
-        }
-
-        const remainingImageBudget = Math.max(0, MAX_TOTAL_IMAGE_BYTES - totalImageBytes);
-        const images = [];
-        let articleImageBytes = 0;
-        for (const image of downloadedImages.images) {
-          if (articleImageBytes + image.data.length > remainingImageBudget) break;
-          images.push(image);
-          articleImageBytes += image.data.length;
-        }
-
         totalText += article.textLength;
-        totalImageBytes += articleImageBytes;
-        results[index] = { ...article, images };
+        results[index] = article;
         job.articlesProcessed += 1;
         job.pagesQueued = Math.max(0, entries.length - job.articlesProcessed);
         if (job.articlesProcessed % 10 === 0 || job.articlesProcessed === entries.length) {
@@ -828,7 +895,7 @@ async function crawlKultprofitaArticles(catalog, job) {
   };
 
   await Promise.all(
-    Array.from({ length: Math.min(KULTPROFITA_CONCURRENCY, entries.length) }, () => worker()),
+    Array.from({ length: Math.min(catalog.apiDelay ? 1 : KULTPROFITA_CONCURRENCY, entries.length) }, () => worker()),
   );
   if (fatalError) throw fatalError;
 
@@ -848,150 +915,83 @@ async function crawlKultprofitaArticles(catalog, job) {
   };
 }
 
-async function crawlArticles(startUrl, limit, dateFrom = '', dateTo = '', job = null) {
+async function crawlArticles(startUrl, limit, dateFrom, dateTo, job) {
   const origin = startUrl.origin;
-  if (job) job.phase = 'checking-rules';
+  job.phase = 'checking-rules';
   const robots = await readRobots(origin);
   const userAgent = 'SiteToWord';
   if (robots.isAllowed(startUrl.toString(), userAgent) === false) {
     throw new Error('Правила robots.txt запрещают обработку указанной страницы');
   }
-  const configuredDelay = Number(robots.getCrawlDelay(userAgent) || 0) * 1000;
-  const delay = Math.max(CRAWL_DELAY_MS, Math.min(configuredDelay, 10_000));
-  const kultprofitaListing = isKultprofitaMaterialsListing(startUrl);
-  const catalog = kultprofitaListing
-    ? await loadKultprofitaCatalog(limit, dateFrom, dateTo, job)
-    : null;
-  if (catalog) return crawlKultprofitaArticles(catalog, job);
-  const maxVisited = limit === Infinity
-    ? MAX_CRAWL_PAGES
-    : Math.min(5000, Math.max(100, limit * 4));
-  const maxDepth = catalog ? 0 : limit === Infinity ? Infinity : 3;
-  const queue = catalog
-    ? catalog.entries.map((entry) => ({
-      url: `https://kultprofita.ru/materials/${encodeURIComponent(entry.slug)}`,
-      depth: 1,
-      catalogEntry: entry,
-    }))
-    : [{ url: startUrl.toString(), depth: 0 }];
-  const visited = new Set();
-  const articles = [];
-  let totalText = 0;
-  let totalImageBytes = 0;
-  let undatedArticles = catalog?.undatedArticles || 0;
-  if (job && !catalog) job.phase = 'scanning';
-  if (job && catalog) {
-    job.pagesQueued = queue.length;
-    job.articlesFound = catalog.entries.length;
-    job.articlesTotal = catalog.entries.length;
+  if (isKultprofitaMaterialsListing(startUrl)) {
+    const catalog = await loadKultprofitaCatalog(limit, dateFrom, dateTo, job);
+    return crawlKultprofitaArticles(catalog, job);
   }
 
-  while (queue.length && visited.size < maxVisited && articles.length < limit) {
-    const current = queue.shift();
-    if (!isCrawlableUrl(current.url, origin) || visited.has(current.url)) continue;
-    if (robots.isAllowed(current.url, userAgent) === false) continue;
-    visited.add(current.url);
-    if (job) {
-      job.pagesVisited = visited.size;
-      job.pagesQueued = catalog ? queue.length + 1 : visited.size + queue.length;
-      job.phase = catalog ? 'loading-articles' : 'scanning';
-      if (current.catalogEntry) job.currentArticle = current.catalogEntry.title;
-    }
+  const delay = robotsDelay(robots);
+  const concurrency = delay ? 1 : PAGE_CONCURRENCY;
+  const maxVisited = limit === Infinity ? MAX_CRAWL_PAGES : Math.min(5000, Math.max(100, limit * 4));
+  const maxDepth = limit === Infinity ? Infinity : 3;
+  const queue = [{ url: startUrl.toString(), depth: 0 }];
+  const discovered = new Set([startUrl.toString()]);
+  const articles = [];
+  let next = 0;
+  let pagesVisited = 0;
+  let totalText = 0;
+  let undatedArticles = 0;
+  job.phase = 'scanning';
 
-    if (visited.size > 1) await wait(Math.max(delay, catalog?.apiDelay || 0));
-    try {
-      const page = catalog
-        ? await fetchKultprofitaArticle(current.catalogEntry, catalog.apiOrigin, catalog.apiRobots)
-        : await fetchPage(new URL(current.url), origin);
-      const extracted = catalog ? page : extractPage(page.html, page.url);
-      const articleUrl = catalog ? page.url : page.url;
-      const publishedDate = catalog
-        ? page.publishedDate
-        : extracted.publishedDate;
-      if ((catalog || page.url !== startUrl.toString()) && (catalog || extracted.isArticle)) {
+  while (next < queue.length && pagesVisited < maxVisited && articles.length < limit) {
+    const count = Math.min(concurrency, maxVisited - pagesVisited);
+    const batch = queue.slice(next, next + count);
+    next += batch.length;
+    if (delay && pagesVisited) await wait(delay);
+    const pages = await Promise.all(batch.map(async ({ url }) => {
+      try {
+        const page = await fetchPage(new URL(url), origin);
+        return { ...extractPage(page.html, page.url), url: page.url };
+      } catch {
+        // Ошибка отдельной страницы не останавливает сбор остальных материалов.
+        return null;
+      }
+    }));
+    pagesVisited += batch.length;
+
+    for (const [index, page] of pages.entries()) {
+      if (!page) continue;
+      if (page.url !== startUrl.toString() && page.isArticle) {
+        const { publishedDate } = page;
         if (!publishedDate && (dateFrom || dateTo)) {
           undatedArticles += 1;
-        } else if (
-          (!dateFrom || publishedDate >= dateFrom)
-          && (!dateTo || publishedDate <= dateTo)
-        ) {
-          if (totalText + extracted.textLength > MAX_TOTAL_TEXT) {
-            throw new Error('Общий объём текста превысил допустимый лимит');
-          }
-          if (job) {
-            if (!catalog) job.articlesFound = articles.length + 1;
-            job.phase = extracted.images.length
-              ? 'downloading-images'
-              : catalog ? 'loading-articles' : 'scanning';
-            job.currentArticle = extracted.title || current.catalogEntry?.title || '';
-            job.imagesProcessed = 0;
-            job.imagesToProcess = extracted.images.length;
-          }
-          const { images, totalBytes } = await downloadImages(
-            extracted.images,
-            MAX_TOTAL_IMAGE_BYTES - totalImageBytes,
-            job
-              ? ({ processed, total, found }) => {
-                job.imagesProcessed = processed;
-                job.imagesToProcess = total;
-                job.imagesFound = (job.imagesFound || 0) - (job.currentArticleImages || 0) + found;
-                job.currentArticleImages = found;
-              }
-              : null,
-          );
-          totalText += extracted.textLength;
-          totalImageBytes += totalBytes;
-          if (job) {
-            job.imagesFound = (job.imagesFound || 0) - (job.currentArticleImages || 0) + images.length;
-            job.currentArticleImages = 0;
-          }
-          articles.push({
-            title: extracted.title || current.catalogEntry?.title || 'Статья',
-            blocks: extracted.blocks,
-            url: articleUrl,
-            publishedDate,
-            images,
-          });
-          if (job) job.articlesProcessed = articles.length;
+        } else if ((!dateFrom || publishedDate >= dateFrom) && (!dateTo || publishedDate <= dateTo)) {
+          totalText += page.textLength;
+          if (totalText > MAX_TOTAL_TEXT) throw new Error('Общий объём текста превысил допустимый лимит');
+          const { title, blocks, url, images } = page;
+          articles.push({ title, blocks, url, publishedDate, images });
+          if (articles.length === limit) break;
         }
       }
-
-      if (!catalog && current.depth < maxDepth) {
-        for (const link of extracted.links) {
-          if (!isCrawlableUrl(link, origin) || visited.has(link)) continue;
-          if (!queue.some((item) => item.url === link)) {
-            queue.push({ url: link, depth: current.depth + 1 });
-          }
-        }
+      const depth = batch[index].depth + 1;
+      if (depth > maxDepth) continue;
+      for (const url of page.links) {
+        if (discovered.has(url) || !isCrawlableUrl(url, origin)) continue;
+        discovered.add(url);
+        if (robots.isAllowed(url, userAgent) !== false) queue.push({ url, depth });
       }
-      if (job) job.pagesQueued = catalog ? queue.length : visited.size + queue.length;
-    } catch (error) {
-      if (error.message === 'Общий объём текста превысил допустимый лимит') throw error;
-      if (job && current.catalogEntry) {
-        job.articleFailures += 1;
-        job.lastArticleError = error.message;
-      }
-      // Ошибка отдельной страницы не останавливает сбор остальных материалов.
     }
+    job.pagesVisited = pagesVisited;
+    job.pagesQueued = queue.length;
+    job.articlesFound = articles.length;
+    job.articlesProcessed = articles.length;
   }
 
   if (!articles.length) {
     throw new Error('Статьи не найдены. Укажите страницу раздела со ссылками на статьи');
   }
-  const result = {
-    articles,
-    undatedArticles,
-    complete: limit !== Infinity || (queue.length === 0 && visited.size < maxVisited),
-  };
-  if (job) {
-    if (!catalog) job.articlesFound = articles.length;
-    job.articlesProcessed = articles.length;
-    job.articlesTotal = articles.length;
-    job.undatedArticles = undatedArticles;
-    job.crawlComplete = result.complete;
-    job.phase = 'preparing-documents';
-  }
-  return result;
+  const complete = limit !== Infinity || (next === queue.length && pagesVisited < maxVisited);
+  job.undatedArticles = undatedArticles;
+  job.crawlComplete = complete;
+  return { articles, undatedArticles, complete };
 }
 
 function validateDate(value, label) {
@@ -1010,106 +1010,108 @@ async function* readArchiveEntry(path) {
   yield* createReadStream(path);
 }
 
-async function createArticleArchive(articles, siteName, job = null) {
+async function createArticleArchive(articles, siteName, job) {
   const zip = new JSZip();
   const folder = zip.folder(siteName);
-  const documentsDirectory = job ? join(jobDataDirectory, job.id, 'documents') : null;
-  if (documentsDirectory) await mkdir(documentsDirectory, { recursive: true });
-  if (job) {
-    job.phase = 'preparing-documents';
-    job.articlesTotal = articles.length;
-    job.preparedArticles = 0;
-    await persistJob(job);
-  }
+  const documentsDirectory = join(jobDataDirectory, job.id, 'documents');
+  await mkdir(documentsDirectory, { recursive: true });
+  job.phase = 'preparing-documents';
+  job.articlesTotal = articles.length;
+  job.imagesToProcess = articles.reduce((count, article) => count + article.images.length, 0);
+  await persistJob(job);
+
+  const imageFailures = new Map();
+  let documentBytes = 0;
+  let archiveTooLarge = false;
   let nextDocument = 0;
   const prepareWorker = async () => {
-    while (true) {
+    while (!archiveTooLarge) {
       const index = nextDocument;
       nextDocument += 1;
       if (index >= articles.length) return;
       const article = articles[index];
-      const articleImageCount = article.images.length;
       try {
-        const document = await createWordDocument([article]);
+        const { images, skipped } = await downloadImages(article.images, article.url, (count) => {
+          job.imagesProcessed += count;
+        });
+        const document = await createWordDocument([{ ...article, images }]);
         await assertReadableDocx(document);
+        // JSZip не записывает ZIP64, поэтому оставляем запас для заголовков архива.
+        if (documentBytes + document.length > MAX_ARCHIVE_DOCUMENT_BYTES) {
+          archiveTooLarge = true;
+          return;
+        }
+        documentBytes += document.length;
         const number = String(index + 1).padStart(3, '0');
         const filename = `${number}_${safeFilename(article.title)}`;
-        if (documentsDirectory) {
-          const documentPath = join(documentsDirectory, filename);
-          await writeFile(documentPath, document);
-          folder.file(filename, Readable.from(readArchiveEntry(documentPath), { objectMode: false }));
-          article.blocks = [];
-          article.images = [];
-        } else {
-          folder.file(filename, document);
-        }
-        if (job) {
-          job.preparedArticles += 1;
-          job.imagesIncluded += articleImageCount;
-        }
+        const documentPath = join(documentsDirectory, filename);
+        await writeFile(documentPath, document);
+        folder.file(filename, Readable.from(readArchiveEntry(documentPath), { objectMode: false }));
+        job.preparedArticles += 1;
+        job.imagesIncluded += images.length;
+        job.imagesFound = job.imagesIncluded;
+        job.imagesSkipped += skipped;
+        if (skipped) imageFailures.set(index, { filename, skipped });
       } catch (error) {
-        if (!job) throw error;
         recordArticleFailure(job, article.title, error);
+      } finally {
         article.blocks = [];
         article.images = [];
       }
-      if (job && (job.preparedArticles % 10 === 0 || nextDocument >= articles.length)) {
-        await persistJob(job);
-      }
+      if ((job.preparedArticles + job.articleFailures) % 10 === 0) await persistJob(job);
     }
   };
   await Promise.all(
     Array.from({ length: Math.min(DOCX_CONCURRENCY, articles.length) }, () => prepareWorker()),
   );
-  if (job && !job.preparedArticles) {
-    throw new Error('Не удалось собрать ни одного Word-файла');
-  }
+  if (archiveTooLarge) throw new Error('Архив слишком большой. Уменьшите количество статей или задайте период выгрузки.');
+  if (!job.preparedArticles) throw new Error('Не удалось собрать ни одного Word-файла');
+
   folder.file(
     'README.txt',
     'Распакуйте ZIP-архив и открывайте файлы .docx в Microsoft Word или совместимом редакторе. Изображения размещены в конце документа статьи.\n',
   );
-  if (job && (job.failedArticles.length || job.restrictedArticleTitles.length)) {
-    const report = [];
-    if (job.restrictedArticleTitles.length) {
-      report.push('Материалы, недоступные без соответствующего доступа:');
-      report.push(...job.restrictedArticleTitles.map((title) => `- ${title}`));
-      report.push('');
-    }
-    if (job.failedArticles.length) {
-      report.push('Материалы с временной или технической ошибкой:');
-      report.push(...job.failedArticles.map(({ title, error }) => `- ${title}: ${error}`));
-    }
-    folder.file('Отчет.txt', report.join('\n'));
+  const report = [];
+  if (job.restrictedArticleTitles.length) {
+    report.push('Материалы, недоступные без соответствующего доступа:');
+    report.push(...job.restrictedArticleTitles.map((title) => `- ${title}`), '');
   }
-  if (job) {
-    job.phase = 'packing-zip';
-    job.zipPercent = 0;
-    await persistJob(job);
-    const archivePath = join(jobDataDirectory, job.id, `${siteName}.zip`);
-    await pipeline(
-      zip.generateNodeStream(
-        {
-          type: 'nodebuffer',
-          // Записываем размеры и CRC в заголовки для совместимости с распаковщиками.
-          streamFiles: false,
-          compression: 'STORE',
-        },
-        (metadata) => {
-          job.zipPercent = Math.floor(metadata.percent);
-        },
-      ),
-      createWriteStream(archivePath),
-    );
-    const archiveStats = await stat(archivePath);
-    if (!archiveStats.size) throw new Error('Получился пустой ZIP-архив');
-    await rm(documentsDirectory, { recursive: true, force: true });
-    job.archivePath = archivePath;
-    job.archiveSize = archiveStats.size;
-    job.zipPercent = 100;
-    return;
+  if (job.failedArticles.length) {
+    report.push('Материалы с временной или технической ошибкой:');
+    report.push(...job.failedArticles.map(({ title, error }) => `- ${title}: ${error}`), '');
   }
-  const archive = await zip.generateAsync({ type: 'nodebuffer', compression: 'STORE' });
-  return archive;
+  if (imageFailures.size) {
+    report.push('Изображения, которые не удалось скачать или встроить:');
+    for (const [, { filename, skipped }] of [...imageFailures.entries()].sort(([a], [b]) => a - b)) {
+      report.push(`- ${filename}: ${skipped}`);
+    }
+  }
+  if (report.length) folder.file('Отчет.txt', report.join('\n'));
+
+  job.phase = 'packing-zip';
+  job.zipPercent = 0;
+  await persistJob(job);
+  const archivePath = join(jobDataDirectory, job.id, `${siteName}.zip`);
+  await pipeline(
+    zip.generateNodeStream(
+      {
+        type: 'nodebuffer',
+        // Записываем размеры и CRC в заголовки для совместимости с распаковщиками.
+        streamFiles: false,
+        compression: 'STORE',
+      },
+      (metadata) => {
+        job.zipPercent = Math.floor(metadata.percent);
+      },
+    ),
+    createWriteStream(archivePath),
+  );
+  const archiveStats = await stat(archivePath);
+  if (!archiveStats.size) throw new Error('Получился пустой ZIP-архив');
+  await rm(documentsDirectory, { recursive: true, force: true });
+  job.archivePath = archivePath;
+  job.archiveSize = archiveStats.size;
+  job.zipPercent = 100;
 }
 
 async function assertReadableDocx(buffer) {
@@ -1164,6 +1166,7 @@ function publicJobStatus(job) {
     preparedArticles: job.preparedArticles,
     imagesFound: job.imagesFound,
     imagesIncluded: job.imagesIncluded,
+    imagesSkipped: job.imagesSkipped || 0,
     imagesProcessed: job.imagesProcessed,
     imagesToProcess: job.imagesToProcess,
     zipPercent: job.zipPercent,
@@ -1295,6 +1298,7 @@ async function runCrawlJob(job, options) {
   job.preparedArticles = 0;
   job.imagesFound = 0;
   job.imagesIncluded = 0;
+  job.imagesSkipped = 0;
   job.imagesProcessed = 0;
   job.imagesToProcess = 0;
   job.zipPercent = 0;
@@ -1306,10 +1310,8 @@ async function runCrawlJob(job, options) {
     const safeUrl = await validatePublicUrl(options.url);
     job.siteName = safeUrl.hostname.replace(/[^a-zA-Z0-9.-]/g, '_');
     const result = await crawlArticles(safeUrl, options.limit, options.dateFrom, options.dateTo, job);
-    const imageCount = result.articles.reduce((count, article) => count + article.images.length, 0);
     await createArticleArchive(result.articles, job.siteName, job);
     job.articlesTotal = job.preparedArticles;
-    job.imagesFound = job.imagesIncluded ?? imageCount;
     job.undatedArticles = result.undatedArticles;
     job.crawlComplete = result.complete
       && job.preparedArticles === result.articles.length
@@ -1326,6 +1328,7 @@ async function runCrawlJob(job, options) {
       ? 'Сайт отвечает слишком долго. Попробуйте позже'
       : error.message || 'Не удалось обработать сайт';
     job.finishedAt = Date.now();
+    await rm(join(jobDataDirectory, job.id), { recursive: true, force: true }).catch(() => {});
     await persistJob(job);
   }
 }
@@ -1369,15 +1372,14 @@ const server = createServer(async (request, response) => {
         'Content-Length': job.archiveSize || archiveStats.size,
         'X-Articles-Count': String(job.articlesTotal),
         'X-Images-Count': String(job.imagesFound),
+        'X-Images-Skipped': String(job.imagesSkipped || 0),
         'X-Article-Failures': String(job.articleFailures),
         'X-Restricted-Articles': String(job.restrictedArticles),
         'X-Undated-Articles': String(job.undatedArticles),
         'X-Crawl-Complete': String(job.crawlComplete),
         'Cache-Control': 'no-store',
       });
-      const archiveStream = createReadStream(job.archivePath);
-      archiveStream.on('error', () => response.destroy());
-      archiveStream.pipe(response);
+      await pipeline(createReadStream(job.archivePath), response).catch(() => {});
       return;
     }
     sendJson(response, 200, publicJobStatus(job));
@@ -1394,7 +1396,8 @@ const server = createServer(async (request, response) => {
       const safeUrl = await validatePublicUrl(body.url.trim());
       const page = await fetchPage(safeUrl);
       const extracted = extractPage(page.html, page.url);
-      const { images } = await downloadImages(extracted.images);
+      const { images } = await downloadImages(extracted.images, page.url);
+      if (!extracted.blocks.length && !images.length) throw new Error('На странице не найден текст или изображения');
       const article = { ...extracted, images, url: page.url };
       const document = await createWordDocument([article]);
       await assertReadableDocx(document);
@@ -1457,6 +1460,7 @@ const server = createServer(async (request, response) => {
         preparedArticles: 0,
         imagesFound: 0,
         imagesIncluded: 0,
+        imagesSkipped: 0,
         imagesProcessed: 0,
         imagesToProcess: 0,
         zipPercent: 0,
