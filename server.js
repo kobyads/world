@@ -6,11 +6,13 @@ import { fileURLToPath } from 'node:url';
 import { dirname, extname, join, sep } from 'node:path';
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
+import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { load } from 'cheerio';
 import { Document, HeadingLevel, ImageRun, Packer, Paragraph, TextRun } from 'docx';
 import robotsParser from 'robots-parser';
 import JSZip from 'jszip';
+import { SaxesParser } from 'saxes';
 import sharp from 'sharp';
 
 const directory = dirname(fileURLToPath(import.meta.url));
@@ -284,17 +286,7 @@ function normalizePublishedDate(candidate) {
 }
 
 function cleanXmlText(value) {
-  return Array.from(String(value), (character) => character.codePointAt(0))
-    .filter((codePoint) => (
-      codePoint === 0x09
-      || codePoint === 0x0a
-      || codePoint === 0x0d
-      || (codePoint >= 0x20 && codePoint <= 0xd7ff)
-      || (codePoint >= 0xe000 && codePoint <= 0xfffd)
-      || (codePoint >= 0x10000 && codePoint <= 0x10ffff)
-    ))
-    .map((codePoint) => String.fromCodePoint(codePoint))
-    .join('');
+  return String(value).replace(/[^\u0009\u000A\u000D\u0020-\uD7FF\uE000-\uFFFD\u{10000}-\u{10FFFF}]/gu, '');
 }
 
 function extractPage(html, pageUrl = 'https://example.invalid') {
@@ -530,20 +522,21 @@ function safeFilename(title) {
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 80);
-  return `${slug || 'tekst-stranitsy'}.docx`;
+  return `${cleanXmlText(slug) || 'tekst-stranitsy'}.docx`;
 }
 
 async function createWordDocument(articles) {
   const paragraphs = [];
   for (const [index, article] of articles.entries()) {
+    const source = `Источник: ${article.url}${article.publishedDate ? ` · Дата публикации: ${article.publishedDate}` : ''}`;
     paragraphs.push(new Paragraph({
-      text: article.title,
+      text: cleanXmlText(article.title) || 'Текст страницы',
       heading: HeadingLevel.TITLE,
       ...(index > 0 ? { pageBreakBefore: true } : {}),
     }));
     paragraphs.push(new Paragraph({
       children: [new TextRun({
-        text: `Источник: ${article.url}${article.publishedDate ? ` · Дата публикации: ${article.publishedDate}` : ''}`,
+        text: cleanXmlText(source),
         italics: true,
         color: '666666',
       })],
@@ -553,7 +546,7 @@ async function createWordDocument(articles) {
     for (const block of article.blocks) {
       const heading = /^h[1-6]$/.test(block.tag);
       paragraphs.push(new Paragraph({
-        text: block.text,
+        text: cleanXmlText(block.text),
         ...(heading
           ? { heading: block.tag === 'h1' ? HeadingLevel.HEADING_1 : HeadingLevel.HEADING_2 }
           : block.tag === 'li' ? { bullet: { indent: 360 } } : {}),
@@ -572,9 +565,10 @@ async function createWordDocument(articles) {
           })],
           spacing: { after: 100 },
         }));
-        if (image.alt) {
+        const caption = cleanXmlText(image.alt ?? '');
+        if (caption) {
           paragraphs.push(new Paragraph({
-            children: [new TextRun({ text: image.alt, italics: true, color: '666666' })],
+            children: [new TextRun({ text: caption, italics: true, color: '666666' })],
             spacing: { after: 180 },
           }));
         }
@@ -584,7 +578,7 @@ async function createWordDocument(articles) {
 
   const document = new Document({
     creator: 'Site to Word',
-    title: articles.length === 1 ? articles[0].title : `Сборник статей (${articles.length})`,
+    title: articles.length === 1 ? cleanXmlText(articles[0].title) || 'Текст страницы' : `Сборник статей (${articles.length})`,
     sections: [{ properties: {}, children: paragraphs }],
   });
   return Packer.toBuffer(document);
@@ -1012,6 +1006,10 @@ function validateDate(value, label) {
   return value;
 }
 
+async function* readArchiveEntry(path) {
+  yield* createReadStream(path);
+}
+
 async function createArticleArchive(articles, siteName, job = null) {
   const zip = new JSZip();
   const folder = zip.folder(siteName);
@@ -1039,7 +1037,7 @@ async function createArticleArchive(articles, siteName, job = null) {
         if (documentsDirectory) {
           const documentPath = join(documentsDirectory, filename);
           await writeFile(documentPath, document);
-          folder.file(filename, createReadStream(documentPath));
+          folder.file(filename, Readable.from(readArchiveEntry(documentPath), { objectMode: false }));
           article.blocks = [];
           article.images = [];
         } else {
@@ -1092,7 +1090,8 @@ async function createArticleArchive(articles, siteName, job = null) {
       zip.generateNodeStream(
         {
           type: 'nodebuffer',
-          streamFiles: true,
+          // Записываем размеры и CRC в заголовки для совместимости с распаковщиками.
+          streamFiles: false,
           compression: 'STORE',
         },
         (metadata) => {
@@ -1115,14 +1114,17 @@ async function createArticleArchive(articles, siteName, job = null) {
 
 async function assertReadableDocx(buffer) {
   const documentZip = await JSZip.loadAsync(buffer);
-  const contentTypes = documentZip.file('[Content_Types].xml');
-  const mainDocument = documentZip.file('word/document.xml');
-  if (!contentTypes || !mainDocument) {
+  const requiredParts = ['[Content_Types].xml', '_rels/.rels', 'word/document.xml'];
+  if (requiredParts.some((part) => !documentZip.file(part))) {
     throw new Error('Не удалось собрать корректный Word-файл. Повторите выгрузку');
   }
-  const xml = await mainDocument.async('text');
-  if (!xml.includes('<w:document')) {
-    throw new Error('Word-файл повреждён при создании. Повторите выгрузку');
+  for (const part of documentZip.file(/\.(?:xml|rels)$/)) {
+    try {
+      const xml = await part.async('text');
+      new SaxesParser({ xmlns: true }).write(xml).close();
+    } catch (error) {
+      throw new Error(`Word-файл повреждён при создании (${part.name})`, { cause: error });
+    }
   }
 }
 
